@@ -11,8 +11,8 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::inputs::process_input;
 
 mod config;
-mod hass;
 mod inputs;
+mod mqtt;
 
 const QUERY: DeviceQuery = DeviceQuery::new(65440, 1, 0x6603, 0x1003);
 
@@ -30,7 +30,16 @@ async fn main() -> Result<(), MirajazzError> {
     // SIGTERM = kill or systemd stop
     let mut sigterm = signal(SignalKind::terminate()).unwrap();
 
-    let mut hass_client = hass::init_client().await;
+    let (mqtt_client, mut mqtt_eventloop) = mqtt::init_client("headless-streamdock");
+    // rumqttc requires the eventloop to be polled continuously to drive the connection.
+    let mqtt_poll_handle = tokio::spawn(async move {
+        loop {
+            if let Err(e) = mqtt_eventloop.poll().await {
+                println!("MQTT connection error: {e}");
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            }
+        }
+    });
 
     let config = config::load_config().expect("Failed to load config");
     let buttons_by_id: HashMap<u8, config::ButtonConfig> =
@@ -51,6 +60,16 @@ async fn main() -> Result<(), MirajazzError> {
 
         // Print out some info from the device
         println!("Connected to '{}'", device.serial_number());
+
+        let device_id = device.serial_number().to_string();
+        mqtt::publish_discovery(
+            &mqtt_client,
+            &device_id,
+            &format!("Stream Dock ({device_id})"),
+            &config.buttons,
+            &config.knobs,
+        )
+        .await;
 
         // Track brightness so we can dim on inactivity and restore on activity.
         let current_brightness: u8 = config.brightness;
@@ -109,10 +128,11 @@ async fn main() -> Result<(), MirajazzError> {
                 for update in updates {
                     match update {
                         DeviceStateUpdate::ButtonDown(i) => {
-                            hass::handle_button(&mut hass_client, &buttons_by_id, i).await;
+                            mqtt::handle_button(&mqtt_client, &device_id, &buttons_by_id, i).await;
                         }
                         DeviceStateUpdate::EncoderTwist(i, value) => {
-                            hass::handle_knob(&mut hass_client, &knobs_by_id, i, value).await;
+                            mqtt::handle_knob(&mqtt_client, &device_id, &knobs_by_id, i, value)
+                                .await;
                         }
                         _ => {}
                     }
@@ -138,6 +158,9 @@ async fn main() -> Result<(), MirajazzError> {
         device.flush().await?;
         device.shutdown().await?;
     }
+
+    mqtt_poll_handle.abort();
+    mqtt_client.disconnect().await.ok();
 
     Ok(())
 }
