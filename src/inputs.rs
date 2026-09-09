@@ -2,8 +2,8 @@ use mirajazz::{error::MirajazzError, types::DeviceInput};
 
 // This file is slightly modified from https://github.com/4ndv/opendeck-akp03/blob/main/src/inputs.rs
 
-const ENCODER_COUNT: usize = 3;
-const KEY_COUNT: usize = 9;
+pub const ENCODER_COUNT: usize = 3;
+pub const KEY_COUNT: usize = 9;
 
 pub fn process_input(input: u8, state: u8) -> Result<DeviceInput, MirajazzError> {
     //println!("Processing input: {}, {}", input, state);

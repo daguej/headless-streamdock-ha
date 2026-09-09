@@ -5,7 +5,6 @@ use mirajazz::{
     state::DeviceStateUpdate,
     types::{ImageFormat, ImageMirroring, ImageMode, ImageRotation},
 };
-use std::collections::HashMap;
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::inputs::process_input;
@@ -42,10 +41,6 @@ async fn main() -> Result<(), MirajazzError> {
     });
 
     let config = config::load_config().expect("Failed to load config");
-    let buttons_by_id: HashMap<u8, config::ButtonConfig> =
-        config.buttons.iter().map(|b| (b.id, b.clone())).collect();
-    let knobs_by_id: HashMap<u8, config::KnobConfig> =
-        config.knobs.iter().map(|k| (k.id, k.clone())).collect();
 
     for dev in list_devices(&[QUERY]).await? {
         println!(
@@ -66,8 +61,6 @@ async fn main() -> Result<(), MirajazzError> {
             &mqtt_client,
             &device_id,
             &format!("Stream Dock ({device_id})"),
-            &config.buttons,
-            &config.knobs,
         )
         .await;
 
@@ -128,11 +121,10 @@ async fn main() -> Result<(), MirajazzError> {
                 for update in updates {
                     match update {
                         DeviceStateUpdate::ButtonDown(i) => {
-                            mqtt::handle_button(&mqtt_client, &device_id, &buttons_by_id, i).await;
+                            mqtt::handle_button(&mqtt_client, &device_id, i).await;
                         }
                         DeviceStateUpdate::EncoderTwist(i, value) => {
-                            mqtt::handle_knob(&mqtt_client, &device_id, &knobs_by_id, i, value)
-                                .await;
+                            mqtt::handle_knob(&mqtt_client, &device_id, i, value).await;
                         }
                         _ => {}
                     }

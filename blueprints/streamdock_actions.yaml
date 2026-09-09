@@ -1,0 +1,143 @@
+blueprint:
+  name: Stream Dock (headless-streamdock) button & knob actions
+  description: >-
+    Single automation that maps every button press and knob turn published by
+    headless-streamdock over MQTT to Home Assistant actions, instead of
+    creating one automation per button. Find the trigger topic in the
+    device's MQTT discovery config (Settings -> Devices & Services -> MQTT ->
+    your Stream Dock device), or just use `streamdock/<serial>/trigger`.
+    Buttons are numbered 0-8 and knobs 0-2, matching the physical device;
+    leave any you don't use empty.
+  domain: automation
+  input:
+    streamdock_topic:
+      name: Trigger topic
+      description: The MQTT trigger topic, e.g. streamdock/4250D278343F/trigger
+      selector:
+        text: {}
+    buttons:
+      name: Buttons
+      icon: mdi:gesture-tap-button
+      collapsed: false
+      input:
+        button_0_action:
+          name: Button 0
+          default: []
+          selector:
+            action: {}
+        button_1_action:
+          name: Button 1
+          default: []
+          selector:
+            action: {}
+        button_2_action:
+          name: Button 2
+          default: []
+          selector:
+            action: {}
+        button_3_action:
+          name: Button 3
+          default: []
+          selector:
+            action: {}
+        button_4_action:
+          name: Button 4
+          default: []
+          selector:
+            action: {}
+        button_5_action:
+          name: Button 5
+          default: []
+          selector:
+            action: {}
+        button_6_action:
+          name: Button 6
+          default: []
+          selector:
+            action: {}
+        button_7_action:
+          name: Button 7
+          default: []
+          selector:
+            action: {}
+        button_8_action:
+          name: Button 8
+          default: []
+          selector:
+            action: {}
+    knobs:
+      name: Knobs
+      icon: mdi:knob
+      collapsed: true
+      input:
+        knob_0_left_action:
+          name: Knob 0 rotated left
+          default: []
+          selector:
+            action: {}
+        knob_0_right_action:
+          name: Knob 0 rotated right
+          default: []
+          selector:
+            action: {}
+        knob_1_left_action:
+          name: Knob 1 rotated left
+          default: []
+          selector:
+            action: {}
+        knob_1_right_action:
+          name: Knob 1 rotated right
+          default: []
+          selector:
+            action: {}
+        knob_2_left_action:
+          name: Knob 2 rotated left
+          default: []
+          selector:
+            action: {}
+        knob_2_right_action:
+          name: Knob 2 rotated right
+          default: []
+          selector:
+            action: {}
+
+triggers:
+  - trigger: mqtt
+    topic: !input streamdock_topic
+
+conditions: []
+
+actions:
+  - choose:
+      - conditions: "{{ trigger.payload == 'button_0_press' }}"
+        sequence: !input button_0_action
+      - conditions: "{{ trigger.payload == 'button_1_press' }}"
+        sequence: !input button_1_action
+      - conditions: "{{ trigger.payload == 'button_2_press' }}"
+        sequence: !input button_2_action
+      - conditions: "{{ trigger.payload == 'button_3_press' }}"
+        sequence: !input button_3_action
+      - conditions: "{{ trigger.payload == 'button_4_press' }}"
+        sequence: !input button_4_action
+      - conditions: "{{ trigger.payload == 'button_5_press' }}"
+        sequence: !input button_5_action
+      - conditions: "{{ trigger.payload == 'button_6_press' }}"
+        sequence: !input button_6_action
+      - conditions: "{{ trigger.payload == 'button_7_press' }}"
+        sequence: !input button_7_action
+      - conditions: "{{ trigger.payload == 'button_8_press' }}"
+        sequence: !input button_8_action
+      - conditions: "{{ trigger.payload == 'knob_0_left' }}"
+        sequence: !input knob_0_left_action
+      - conditions: "{{ trigger.payload == 'knob_0_right' }}"
+        sequence: !input knob_0_right_action
+      - conditions: "{{ trigger.payload == 'knob_1_left' }}"
+        sequence: !input knob_1_left_action
+      - conditions: "{{ trigger.payload == 'knob_1_right' }}"
+        sequence: !input knob_1_right_action
+      - conditions: "{{ trigger.payload == 'knob_2_left' }}"
+        sequence: !input knob_2_left_action
+      - conditions: "{{ trigger.payload == 'knob_2_right' }}"
+        sequence: !input knob_2_right_action
+
+mode: single

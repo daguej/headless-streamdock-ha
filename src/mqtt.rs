@@ -1,9 +1,9 @@
 use dotenv::dotenv;
 use rumqttc::{AsyncClient, EventLoop, MqttOptions, QoS};
 use serde_json::json;
-use std::{collections::HashMap, env::var, time::Duration};
+use std::{env::var, time::Duration};
 
-use crate::config;
+use crate::inputs::{ENCODER_COUNT, KEY_COUNT};
 
 const MANUFACTURER: &str = "Mirabox";
 const MODEL: &str = "Stream Dock N3";
@@ -36,13 +36,7 @@ fn trigger_topic(device_id: &str) -> String {
 }
 
 // Publishes retained HA MQTT device-automation discovery configs, one trigger per button and two (rotate_left/rotate_right) per knob.
-pub async fn publish_discovery(
-    client: &AsyncClient,
-    device_id: &str,
-    device_name: &str,
-    buttons: &[config::ButtonConfig],
-    knobs: &[config::KnobConfig],
-) {
+pub async fn publish_discovery(client: &AsyncClient, device_id: &str, device_name: &str) {
     let prefix = discovery_prefix();
     let topic = trigger_topic(device_id);
     let device = json!({
@@ -52,14 +46,14 @@ pub async fn publish_discovery(
         "model": MODEL,
     });
 
-    for b in buttons {
+    for id in 0..KEY_COUNT as u8 {
         let payload = json!({
             "automation_type": "trigger",
             "platform": "device_automation",
             "topic": topic,
             "type": "button_short_press",
-            "subtype": b.name,
-            "payload": format!("button_{}_press", b.id),
+            "subtype": format!("Button {id}"),
+            "payload": format!("button_{id}_press"),
             "device": device,
         });
 
@@ -67,25 +61,25 @@ pub async fn publish_discovery(
             client,
             &prefix,
             device_id,
-            &format!("button_{}", b.id),
+            &format!("button_{id}"),
             &payload,
         )
         .await;
     }
 
-    for k in knobs {
+    for id in 0..ENCODER_COUNT as u8 {
         for (direction, suffix) in [("rotate_left", "left"), ("rotate_right", "right")] {
             let payload = json!({
                 "automation_type": "trigger",
                 "platform": "device_automation",
                 "topic": topic,
                 "type": direction,
-                "subtype": k.name,
-                "payload": format!("knob_{}_{suffix}", k.id),
+                "subtype": format!("Knob {id}"),
+                "payload": format!("knob_{id}_{suffix}"),
                 "device": device,
             });
 
-            let object_id = format!("knob_{}_{suffix}", k.id);
+            let object_id = format!("knob_{id}_{suffix}");
             publish_discovery_config(client, &prefix, device_id, &object_id, &payload).await;
         }
     }
@@ -105,32 +99,13 @@ async fn publish_discovery_config(
         .unwrap_or_else(|_| println!("Failed to publish discovery config for {object_id}"));
 }
 
-pub async fn handle_button(
-    client: &AsyncClient,
-    device_id: &str,
-    buttons: &HashMap<u8, config::ButtonConfig>,
-    i: u8,
-) {
-    if buttons.contains_key(&i) {
-        publish_trigger(client, device_id, &format!("button_{i}_press")).await;
-    } else {
-        println!("No config for button {i}")
-    }
+pub async fn handle_button(client: &AsyncClient, device_id: &str, i: u8) {
+    publish_trigger(client, device_id, &format!("button_{i}_press")).await;
 }
 
-pub async fn handle_knob(
-    client: &AsyncClient,
-    device_id: &str,
-    knobs: &HashMap<u8, config::KnobConfig>,
-    i: u8,
-    value: i8,
-) {
-    if knobs.contains_key(&i) {
-        let suffix = if value > 0 { "right" } else { "left" };
-        publish_trigger(client, device_id, &format!("knob_{i}_{suffix}")).await;
-    } else {
-        println!("No config for knob {i}")
-    }
+pub async fn handle_knob(client: &AsyncClient, device_id: &str, i: u8, value: i8) {
+    let suffix = if value > 0 { "right" } else { "left" };
+    publish_trigger(client, device_id, &format!("knob_{i}_{suffix}")).await;
 }
 
 async fn publish_trigger(client: &AsyncClient, device_id: &str, payload: &str) {
