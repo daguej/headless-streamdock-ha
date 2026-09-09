@@ -73,7 +73,7 @@ async fn main() -> Result<(), MirajazzError> {
         // Write it to the device
         for b in &config.buttons {
             let image = open(format!("images/{}", b.icon))
-                .expect(format!("Failed to open image {}", b.icon).as_str());
+                .unwrap_or_else(|_| panic!("Failed to open image {}", b.icon));
             device
                 .set_button_image(b.id, IMAGE_FORMAT, image.clone())
                 .await?;
