@@ -1,15 +1,16 @@
 blueprint:
-  name: Stream Dock N3 (headless-streamdock) button & knob actions
+  name: Stream Dock N1 (headless-streamdock) button & knob actions
   description: >-
     Single automation that maps every button press, knob turn and knob press
     published by headless-streamdock over MQTT to Home Assistant actions,
     instead of creating one automation per button. This is the variant for the
-    Mirabox N3 (and compatible devices such as the Ajazz AKP03); use
-    streamdock_n1_actions.yaml for the VSD Inside N1. Find the trigger topic in
-    the device's MQTT discovery config (Settings -> Devices & Services -> MQTT
-    -> your Stream Dock device), or just use `streamdock/<serial>/trigger`.
-    Buttons are numbered 0-8 and knobs 0-2, matching the physical device;
-    leave any you don't use empty.
+    VSD Inside N1 (and compatible devices such as the Mirabox N1); use
+    streamdock_actions.yaml for the Mirabox N3. Find the trigger topic in the
+    device's MQTT discovery config (Settings -> Devices & Services -> MQTT ->
+    your Stream Dock device), or just use `streamdock/<serial>/trigger`.
+    Buttons 0-14 are the key screens, numbered left to right and top to bottom,
+    and buttons 15-16 are the two buttons above the LCD strip. Leave any you
+    don't use empty.
   domain: automation
   input:
     streamdock_topic:
@@ -67,6 +68,46 @@ blueprint:
           default: []
           selector:
             action: {}
+        button_9_action:
+          name: Button 9
+          default: []
+          selector:
+            action: {}
+        button_10_action:
+          name: Button 10
+          default: []
+          selector:
+            action: {}
+        button_11_action:
+          name: Button 11
+          default: []
+          selector:
+            action: {}
+        button_12_action:
+          name: Button 12
+          default: []
+          selector:
+            action: {}
+        button_13_action:
+          name: Button 13
+          default: []
+          selector:
+            action: {}
+        button_14_action:
+          name: Button 14
+          default: []
+          selector:
+            action: {}
+        button_15_action:
+          name: Top button left
+          default: []
+          selector:
+            action: {}
+        button_16_action:
+          name: Top button right
+          default: []
+          selector:
+            action: {}
     knobs:
       name: Knobs
       icon: mdi:knob
@@ -84,36 +125,6 @@ blueprint:
             action: {}
         knob_0_press_action:
           name: Knob 0 pressed
-          default: []
-          selector:
-            action: {}
-        knob_1_left_action:
-          name: Knob 1 rotated left
-          default: []
-          selector:
-            action: {}
-        knob_1_right_action:
-          name: Knob 1 rotated right
-          default: []
-          selector:
-            action: {}
-        knob_1_press_action:
-          name: Knob 1 pressed
-          default: []
-          selector:
-            action: {}
-        knob_2_left_action:
-          name: Knob 2 rotated left
-          default: []
-          selector:
-            action: {}
-        knob_2_right_action:
-          name: Knob 2 rotated right
-          default: []
-          selector:
-            action: {}
-        knob_2_press_action:
-          name: Knob 2 pressed
           default: []
           selector:
             action: {}
@@ -144,23 +155,27 @@ actions:
         sequence: !input button_7_action
       - conditions: "{{ trigger.payload == 'button_8_press' }}"
         sequence: !input button_8_action
+      - conditions: "{{ trigger.payload == 'button_9_press' }}"
+        sequence: !input button_9_action
+      - conditions: "{{ trigger.payload == 'button_10_press' }}"
+        sequence: !input button_10_action
+      - conditions: "{{ trigger.payload == 'button_11_press' }}"
+        sequence: !input button_11_action
+      - conditions: "{{ trigger.payload == 'button_12_press' }}"
+        sequence: !input button_12_action
+      - conditions: "{{ trigger.payload == 'button_13_press' }}"
+        sequence: !input button_13_action
+      - conditions: "{{ trigger.payload == 'button_14_press' }}"
+        sequence: !input button_14_action
+      - conditions: "{{ trigger.payload == 'button_15_press' }}"
+        sequence: !input button_15_action
+      - conditions: "{{ trigger.payload == 'button_16_press' }}"
+        sequence: !input button_16_action
       - conditions: "{{ trigger.payload == 'knob_0_left' }}"
         sequence: !input knob_0_left_action
       - conditions: "{{ trigger.payload == 'knob_0_right' }}"
         sequence: !input knob_0_right_action
       - conditions: "{{ trigger.payload == 'knob_0_press' }}"
         sequence: !input knob_0_press_action
-      - conditions: "{{ trigger.payload == 'knob_1_left' }}"
-        sequence: !input knob_1_left_action
-      - conditions: "{{ trigger.payload == 'knob_1_right' }}"
-        sequence: !input knob_1_right_action
-      - conditions: "{{ trigger.payload == 'knob_1_press' }}"
-        sequence: !input knob_1_press_action
-      - conditions: "{{ trigger.payload == 'knob_2_left' }}"
-        sequence: !input knob_2_left_action
-      - conditions: "{{ trigger.payload == 'knob_2_right' }}"
-        sequence: !input knob_2_right_action
-      - conditions: "{{ trigger.payload == 'knob_2_press' }}"
-        sequence: !input knob_2_press_action
 
 mode: single

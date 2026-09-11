@@ -3,10 +3,7 @@ use rumqttc::{AsyncClient, EventLoop, MqttOptions, QoS};
 use serde_json::json;
 use std::{env::var, time::Duration};
 
-use crate::inputs::{ENCODER_COUNT, KEY_COUNT};
-
-const MANUFACTURER: &str = "Mirabox";
-const MODEL: &str = "Stream Dock N3";
+use crate::mappings::Kind;
 
 pub fn init_client(client_id: &str) -> (AsyncClient, EventLoop) {
     dotenv().ok();
@@ -35,24 +32,26 @@ fn trigger_topic(device_id: &str) -> String {
     format!("streamdock/{device_id}/trigger")
 }
 
-// Publishes retained HA MQTT device-automation discovery configs, one trigger per button and two (rotate_left/rotate_right) per knob.
-pub async fn publish_discovery(client: &AsyncClient, device_id: &str, device_name: &str) {
+// Publishes retained HA MQTT device-automation discovery configs: one trigger per button and
+// three (rotate_left/rotate_right/press) per knob. The amount of buttons and knobs depends on
+// the model of the connected device.
+pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind) {
     let prefix = discovery_prefix();
     let topic = trigger_topic(device_id);
     let device = json!({
         "identifiers": [format!("streamdock_{device_id}")],
-        "name": device_name,
-        "manufacturer": MANUFACTURER,
-        "model": MODEL,
+        "name": format!("Stream Dock ({device_id})"),
+        "manufacturer": kind.manufacturer(),
+        "model": kind.model(),
     });
 
-    for id in 0..KEY_COUNT as u8 {
+    for id in 0..kind.key_count() as u8 {
         let payload = json!({
             "automation_type": "trigger",
             "platform": "device_automation",
             "topic": topic,
             "type": "button_short_press",
-            "subtype": format!("Button {id}"),
+            "subtype": kind.button_label(id),
             "payload": format!("button_{id}_press"),
             "device": device,
         });
@@ -67,14 +66,18 @@ pub async fn publish_discovery(client: &AsyncClient, device_id: &str, device_nam
         .await;
     }
 
-    for id in 0..ENCODER_COUNT as u8 {
-        for (direction, suffix) in [("rotate_left", "left"), ("rotate_right", "right")] {
+    for id in 0..kind.encoder_count() as u8 {
+        for (trigger_type, suffix) in [
+            ("rotate_left", "left"),
+            ("rotate_right", "right"),
+            ("button_short_press", "press"),
+        ] {
             let payload = json!({
                 "automation_type": "trigger",
                 "platform": "device_automation",
                 "topic": topic,
-                "type": direction,
-                "subtype": format!("Knob {id}"),
+                "type": trigger_type,
+                "subtype": kind.knob_label(id),
                 "payload": format!("knob_{id}_{suffix}"),
                 "device": device,
             });
@@ -106,6 +109,10 @@ pub async fn handle_button(client: &AsyncClient, device_id: &str, i: u8) {
 pub async fn handle_knob(client: &AsyncClient, device_id: &str, i: u8, value: i8) {
     let suffix = if value > 0 { "right" } else { "left" };
     publish_trigger(client, device_id, &format!("knob_{i}_{suffix}")).await;
+}
+
+pub async fn handle_knob_press(client: &AsyncClient, device_id: &str, i: u8) {
+    publish_trigger(client, device_id, &format!("knob_{i}_press")).await;
 }
 
 async fn publish_trigger(client: &AsyncClient, device_id: &str, payload: &str) {

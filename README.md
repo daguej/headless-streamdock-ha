@@ -1,10 +1,19 @@
 # Headless Stream Dock HA controller
 
-This project allows you to use "Stream dock" such as Mirabox N3 connected to (headless) Linux as a Home Assistant input device. Each button and knob is registered with Home Assistant over MQTT discovery as a device trigger, so you build the actual automations (what a button press or knob turn should do) in Home Assistant itself, rather than hardcoding them here. The project uses [Mirajazz library](https://github.com/4ndv/mirajazz/) and is partially derived from [OpenDeck Ajazz AKP03 / Mirabox N3 plugin](https://github.com/4ndv/opendeck-akp03).
+This project allows you to use "Stream dock" devices such as the Mirabox N3 or the VSD Inside N1 connected to (headless) Linux as a Home Assistant input device. Each button and knob is registered with Home Assistant over MQTT discovery as a device trigger, so you build the actual automations (what a button press or knob turn should do) in Home Assistant itself, rather than hardcoding them here. The project uses [Mirajazz library](https://github.com/4ndv/mirajazz/) and is partially derived from [OpenDeck Ajazz AKP03 / Mirabox N3 plugin](https://github.com/4ndv/opendeck-akp03) and [OpenDeck VSD Inside N1 plugin](https://github.com/rattenjunge-samu/opendeck-vsd-n1).
+
+## Supported devices
+
+| Device | USB ID | Buttons | Knobs | Screens |
+| --- | --- | --- | --- | --- |
+| Mirabox Stream Dock N3 (and compatible, e.g. Ajazz AKP03) | `6603:1003` | 9 (ids 0-8) | 3 (ids 0-2) | buttons 0-5 |
+| VSD Inside N1 (and compatible, e.g. Mirabox N1) | `5548:1002` | 17 (ids 0-16) | 1 (id 0) | buttons 0-14, plus a 3-segment LCD strip |
+
+Connected devices are detected by their USB ID, so nothing has to be configured to pick a model. On the N1, buttons 15 and 16 are the two buttons above the LCD strip and have no screen of their own, and the LCD strip itself only shows images, it reports no input.
 
 ## Before running the app
 
-To detect the device, you have to set some udev rules. Download the [udev rules](https://github.com/4ndv/opendeck-akp03/blob/main/40-opendeck-akp03.rules) and install them by copying into `/etc/udev/rules.d/` and running `sudo udevadm control --reload-rules`. Unplug and plug again the device after this.
+To detect the device, you have to set some udev rules. Copy the included [40-headless-streamdock.rules](40-headless-streamdock.rules) into `/etc/udev/rules.d/` and run `sudo udevadm control --reload-rules`. The rules give the device to the `plugdev` group, so make sure the user running this program is a member of it (`sudo usermod -aG plugdev <user>`); the file also contains a `uaccess` variant for desktop use. Unplug and plug the device in again after this.
 
 You also need an MQTT broker connected to Home Assistant's [MQTT integration](https://www.home-assistant.io/integrations/mqtt/). If you don't have one yet, the easiest option is installing the official "Mosquitto broker" add-on from the Home Assistant add-on store, then setting up the MQTT integration to use it (Settings -> Devices & Services -> Add Integration -> MQTT).
 
@@ -35,34 +44,40 @@ icon = "light.png" # icon for button, corresponding file must be in `images/` di
 [[buttons]]
 id = 5
 icon = "candle.png"
+
+# Only on devices with an LCD strip, such as the N1
+[[lcd]]
+id = 0 # segment of the LCD strip, left to right
+icon = "clock.png"
 ```
 
-All images referenced in the config should be placed in the `images/` directory
+All images referenced in the config should be placed in the `images/` directory. Entries for buttons or LCD segments the connected device doesn't have (for example `id = 8` on a device whose screens stop at button 5) are skipped with a warning, so the same config file can be used with either model.
 
 ## Setting up automations in Home Assistant
 
 Once the app is running and connected to your MQTT broker, it publishes discovery data and a new device named "Stream Dock (...)" appears under Settings -> Devices & Services -> MQTT. From there you can build one "Device" automation per button/knob trigger (Settings -> Automations -> Add Automation -> When -> Device -> select the Stream Dock device -> pick a trigger such as "Button 1 pressed" or "Knob 0 rotated left/right").
 
-Creating a separate automation per button gets unwieldy quickly, though, so a [blueprint](blueprints/streamdock_actions.yaml) is included that maps every button and knob for one device in a single automation:
+Creating a separate automation per button gets unwieldy quickly, though, so blueprints are included that map every button and knob for one device in a single automation. Use [blueprints/streamdock_actions.yaml](blueprints/streamdock_actions.yaml) for the N3 and [blueprints/streamdock_n1_actions.yaml](blueprints/streamdock_n1_actions.yaml) for the N1:
 
-1. Settings -> Automations -> Blueprints -> Import Blueprint, and point it at the raw contents of [blueprints/streamdock_actions.yaml](blueprints/streamdock_actions.yaml) (or copy the file into your `config/blueprints/automation/<name>/` folder and reload blueprints).
+1. Settings -> Automations -> Blueprints -> Import Blueprint, and point it at the raw contents of the blueprint for your device (or copy the file into your `config/blueprints/automation/<name>/` folder and reload blueprints).
 2. Create a new automation from the imported blueprint.
 3. Fill in the trigger topic (`streamdock/<serial>/trigger`, visible in the device's MQTT discovery config) and an action for each button/knob you want to use; unused ones can stay empty.
 
 ## Compatibility
 
-This program is only tested with Mirabox N3, but the underlying library supports also similar devices such as Ajazz AKP03. To get parameters for your device, you can examine the `dmesg` output and you should see something like:
+Adding another device of the same family usually only takes a new entry in [src/mappings.rs](src/mappings.rs) and, if its report codes differ, a decoder in [src/inputs.rs](src/inputs.rs). To get the USB ID for your device, you can examine the `dmesg` output and you should see something like:
 
 ```
 New USB device found, idVendor=6603, idProduct=1003, bcdDevice= 0.02
 ```
 
-Which means `vendor_id = 0x6603` and `product_id = 0x1003`.
+Which means `vendor_id = 0x6603` and `product_id = 0x1003`. If the device is recognized but sends button codes this program doesn't know, it prints `Ignoring unknown N1 input: code=0x..` lines you can use to work out the mapping. The [OpenDeck wiki](https://github.com/4ndv/opendeck-akp03/wiki/Adding-support-for-new-devices) has more on this.
 
 ## Features
 
 - Register buttons and knobs as Home Assistant MQTT device triggers, so actions are defined via HA automations
-- Includes a [blueprint](blueprints/streamdock_actions.yaml) to map all buttons/knobs in a single automation
-- Set custom pictures for buttons with screens
+- Support for multiple device models, detected automatically by USB ID
+- Includes [blueprints](blueprints/) to map all buttons/knobs in a single automation
+- Set custom pictures for buttons with screens, and for the LCD strip on devices that have one
 - Configure timeout for screens
 - Configure screen brightness

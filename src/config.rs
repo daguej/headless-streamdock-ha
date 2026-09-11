@@ -5,11 +5,14 @@ pub struct Config {
     pub brightness: u8,
     pub timeout: u64,
     #[serde(default)]
-    pub buttons: Vec<ButtonConfig>,
+    pub buttons: Vec<ImageConfig>,
+    /// Segments of the secondary LCD strip, on devices that have one
+    #[serde(default)]
+    pub lcd: Vec<ImageConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct ButtonConfig {
+pub struct ImageConfig {
     pub id: u8,
     pub icon: String,
 }
