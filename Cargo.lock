@@ -586,6 +586,7 @@ name = "headless-streamdock-ha"
 version = "1.0.0"
 dependencies = [
  "dotenv",
+ "futures-lite",
  "image",
  "mirajazz",
  "rumqttc",

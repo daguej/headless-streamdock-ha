@@ -1,12 +1,15 @@
-use image::open;
+use futures_lite::{Stream, StreamExt};
 use mirajazz::{
-    device::{Device, list_devices},
-    error::MirajazzError,
-    state::DeviceStateUpdate,
-    types::HidDeviceInfo,
+    device::{DeviceWatcher, list_devices},
+    types::{DeviceLifecycleEvent, HidDeviceInfo},
 };
-use std::time::Duration;
-use tokio::signal::unix::{SignalKind, signal};
+use rumqttc::AsyncClient;
+use std::{collections::HashMap, error::Error, time::Duration};
+use tokio::{
+    signal::unix::{SignalKind, signal},
+    sync::watch,
+    task::{AbortHandle, JoinSet},
+};
 
 use crate::{
     config::Config,
@@ -14,16 +17,22 @@ use crate::{
 };
 
 mod config;
+mod device;
 mod inputs;
 mod mappings;
 mod mqtt;
 
+/// How long devices get to put their screens to sleep before we stop waiting for them
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 #[tokio::main]
-async fn main() -> Result<(), MirajazzError> {
+async fn main() -> Result<(), Box<dyn Error>> {
     // SIGINT = Ctrl+C
-    let mut sigint = signal(SignalKind::interrupt()).unwrap();
+    let mut sigint = signal(SignalKind::interrupt())?;
     // SIGTERM = kill or systemd stop
-    let mut sigterm = signal(SignalKind::terminate()).unwrap();
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    let config = config::load_config().expect("Failed to load config");
 
     let (mqtt_client, mut mqtt_eventloop) = mqtt::init_client("headless-streamdock");
     // rumqttc requires the eventloop to be polled continuously to drive the connection.
@@ -31,174 +40,65 @@ async fn main() -> Result<(), MirajazzError> {
         loop {
             if let Err(e) = mqtt_eventloop.poll().await {
                 println!("MQTT connection error: {e}");
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
     });
 
-    let config = config::load_config().expect("Failed to load config");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut devices = Devices::new(config, mqtt_client.clone(), shutdown_rx);
 
-    let devices = list_devices(QUERIES).await?;
-
-    if devices.is_empty() {
-        println!("No supported devices found, check that the udev rules are installed");
-    }
-
-    for dev in devices {
-        // The queries only match known devices, so this is mostly here to get the kind
-        let Some(kind) = Kind::from_vid_pid(dev.vendor_id, dev.product_id) else {
+    // Start watching before enumerating, so a device plugged in while we are starting up is
+    // picked up by one or the other. Attaching is idempotent, so showing up in both is fine.
+    let mut watcher = DeviceWatcher::new();
+    let mut events = match watcher.watch(QUERIES).await {
+        Ok(events) => Some(events),
+        Err(e) => {
             println!(
-                "Ignoring unsupported device {:04X}:{:04X}",
-                dev.vendor_id, dev.product_id
+                "Hotplug detection unavailable ({e}), only devices connected now will be used"
             );
 
-            continue;
-        };
-
-        println!(
-            "Connecting to {} {} ({:04X}:{:04X})",
-            kind.manufacturer(),
-            kind.model(),
-            dev.vendor_id,
-            dev.product_id
-        );
-
-        // Connect to the device
-        let device = connect(&dev, kind).await?;
-
-        // Print out some info from the device
-        println!("Connected to '{}'", device.serial_number());
-
-        let device_id = device.serial_number().to_string();
-        mqtt::publish_discovery(&mqtt_client, &device_id, kind).await;
-
-        // Some devices ignore every other command until they are put into the right mode
-        if let Some(mode) = kind.startup_mode() {
-            device.set_mode(mode).await?;
+            None
         }
+    };
 
-        // Track brightness so we can dim on inactivity and restore on activity.
-        let current_brightness: u8 = config.brightness;
-        device.set_brightness(current_brightness).await?;
-        device.clear_all_button_images().await?;
+    for dev in list_devices(QUERIES).await? {
+        devices.attach(dev.to_device_info());
+    }
 
-        println!(
-            "Key count: {} ({} with a screen), encoder count: {}",
-            kind.key_count(),
-            kind.screen_key_count(),
-            kind.encoder_count()
-        );
+    if devices.is_empty() {
+        println!("No supported devices connected, check that the udev rules are installed");
 
-        // Write the configured images to the device
-        set_images(&device, kind, &config).await?;
-
-        // Flush
-        device.flush().await?;
-
-        let reader = device.get_reader(kind.process_input());
-
-        let main_loop = async {
-            use tokio::time::{Duration, Instant, timeout_at};
-
-            // We dim after `timeout` seconds of inactivity.
-            let idle_timeout = Duration::from_secs(config.timeout);
-            let mut is_dimmed = false;
-            let mut idle_deadline = Instant::now() + idle_timeout;
-
-            loop {
-                // While the screens are lit, stop waiting at the idle deadline so we can dim.
-                // Once dimmed there is nothing to wait for but the next input.
-                let result = if is_dimmed {
-                    Ok(reader.read(None).await)
-                } else {
-                    timeout_at(idle_deadline, reader.read(None)).await
-                };
-
-                let updates = match result {
-                    Ok(Ok(updates)) => updates,
-                    // A report we couldn't decode isn't worth giving up over
-                    Ok(Err(MirajazzError::BadData)) => {
-                        println!("Ignoring unrecognized report from device");
-                        continue;
-                    }
-                    Ok(Err(e)) => {
-                        println!("Failed to read from device: {e}");
-                        break;
-                    }
-                    Err(_) => {
-                        if !is_dimmed {
-                            if let Err(e) = device.sleep().await {
-                                println!("Failed to dim brightness: {e}");
-                            } else {
-                                is_dimmed = true;
-                            }
-                        }
-                        continue;
-                    }
-                };
-
-                // Devices also send frames that aren't input at all (the N1 has a periodic
-                // status frame), and those shouldn't count as activity.
-                if updates.is_empty() {
-                    continue;
-                }
-
-                // We got some updates: ensure brightness is restored if we were dimmed.
-                if is_dimmed {
-                    if let Err(e) = device.set_brightness(current_brightness).await {
-                        println!("Failed to restore brightness: {e}");
-                    } else {
-                        is_dimmed = false;
-                    }
-                }
-
-                idle_deadline = Instant::now() + idle_timeout;
-
-                // Event handler
-                for update in updates {
-                    match update {
-                        DeviceStateUpdate::ButtonDown(i) => {
-                            mqtt::handle_button(&mqtt_client, &device_id, i).await;
-                        }
-                        DeviceStateUpdate::EncoderTwist(i, value) => {
-                            mqtt::handle_knob(&mqtt_client, &device_id, i, value).await;
-                        }
-                        DeviceStateUpdate::EncoderDown(i) => {
-                            mqtt::handle_knob_press(&mqtt_client, &device_id, i).await;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        };
-
-        // Ensure controlled exit
-        let mut shutting_down = false;
-
-        tokio::select! {
-            _ = main_loop => {},
-            _ = keepalive_loop(&device, kind) => {},
-            _ = sigint.recv() => {
-                shutting_down = true;
-                println!("Received SIGINT")
-            },
-            _ = sigterm.recv() => {
-                shutting_down = true;
-                println!("Received SIGTERM")
-            }
-        }
-
-        println!("Exiting...");
-
-        drop(reader);
-
-        device.flush().await?;
-        device.shutdown().await?;
-
-        if shutting_down {
-            break;
+        if events.is_some() {
+            println!("Waiting for one to be plugged in");
         }
     }
+
+    loop {
+        tokio::select! {
+            event = next_event(&mut events) => match event {
+                DeviceLifecycleEvent::Connected(info) => devices.attach(info),
+                DeviceLifecycleEvent::Disconnected(info) => devices.detach(&info),
+            },
+            // A device that stopped on its own (an error, or an unplug the watcher hasn't
+            // reported yet) has to be forgotten so it can be attached again later
+            Some(_) = devices.join_next() => devices.reap(),
+            _ = sigint.recv() => {
+                println!("Received SIGINT");
+                break;
+            }
+            _ = sigterm.recv() => {
+                println!("Received SIGTERM");
+                break;
+            }
+        }
+    }
+
+    println!("Exiting...");
+
+    // Let the devices shut their screens down before we tear the process down
+    shutdown_tx.send_replace(true);
+    devices.shutdown().await;
 
     mqtt_poll_handle.abort();
     mqtt_client.disconnect().await.ok();
@@ -206,102 +106,128 @@ async fn main() -> Result<(), MirajazzError> {
     Ok(())
 }
 
-/// Connects to a device, retrying while it looks like udev hasn't caught up with it yet,
-/// which happens when this program starts at boot together with the device
-async fn connect(dev: &HidDeviceInfo, kind: Kind) -> Result<Device, MirajazzError> {
-    const MAX_ATTEMPTS: u8 = 10;
-    const RETRY_DELAY: Duration = Duration::from_millis(300);
-
-    for attempt in 1..=MAX_ATTEMPTS {
-        let error = match Device::connect(
-            dev,
-            kind.protocol_version(),
-            kind.key_count(),
-            kind.encoder_count(),
-        )
-        .await
-        {
-            Ok(device) => return Ok(device),
-            Err(error) => error,
-        };
-
-        let message = error.to_string();
-        let retryable = message.contains("Permission denied")
-            || message.contains("Resource busy")
-            || message.contains("Disconnected");
-
-        if !retryable || attempt == MAX_ATTEMPTS {
-            return Err(error);
-        }
-
-        println!("Connect attempt {attempt}/{MAX_ATTEMPTS} failed: {message}, retrying");
-        tokio::time::sleep(RETRY_DELAY).await;
-    }
-
-    unreachable!("the loop above returns on the last attempt");
-}
-
-/// Writes the images from the config to the buttons and LCD segments the device actually has
-async fn set_images(device: &Device, kind: Kind, config: &Config) -> Result<(), MirajazzError> {
-    for button in &config.buttons {
-        if button.id as usize >= kind.screen_key_count() {
-            println!(
-                "Ignoring icon for button {}: {} {} only has screens on {} buttons",
-                button.id,
-                kind.manufacturer(),
-                kind.model(),
-                kind.screen_key_count()
-            );
-
-            continue;
-        }
-
-        device
-            .set_button_image(button.id, kind.image_format(), load_icon(&button.icon))
-            .await?;
-    }
-
-    for segment in &config.lcd {
-        let Some(hw_key) = kind.lcd_hw_key(segment.id) else {
-            println!(
-                "Ignoring icon for LCD segment {}: {} {} has {} LCD segments",
-                segment.id,
-                kind.manufacturer(),
-                kind.model(),
-                kind.lcd_segment_count()
-            );
-
-            continue;
-        };
-
-        device
-            .set_button_image(hw_key, kind.lcd_image_format(), load_icon(&segment.icon))
-            .await?;
-    }
-
-    Ok(())
-}
-
-fn load_icon(icon: &str) -> image::DynamicImage {
-    open(format!("images/{icon}")).unwrap_or_else(|_| panic!("Failed to open image {icon}"))
-}
-
-/// Pings devices that drop the connection when idle. Never returns for devices that don't
-/// need it, so it can always be selected over.
-async fn keepalive_loop(device: &Device, kind: Kind) {
-    let Some(interval) = kind.keepalive_interval() else {
-        std::future::pending::<()>().await;
-
-        return;
+/// Yields the next hotplug event, and never resolves once there are no more to come, so it
+/// can always be selected over
+async fn next_event<S>(events: &mut Option<S>) -> DeviceLifecycleEvent
+where
+    S: Stream<Item = DeviceLifecycleEvent> + Unpin,
+{
+    let event = match events {
+        Some(events) => events.next().await,
+        None => None,
     };
 
-    loop {
-        tokio::time::sleep(interval).await;
+    match event {
+        Some(event) => event,
+        None => std::future::pending().await,
+    }
+}
 
-        if let Err(e) = device.keep_alive().await {
-            println!("Keepalive failed: {e}");
+/// Keeps one task per connected device, so every device runs independently of the others
+struct Devices {
+    config: Config,
+    mqtt_client: AsyncClient,
+    shutdown: watch::Receiver<bool>,
+    /// Serial number of every device we are currently running, and the handle to stop it
+    running: HashMap<String, AbortHandle>,
+    tasks: JoinSet<()>,
+}
+
+impl Devices {
+    fn new(config: Config, mqtt_client: AsyncClient, shutdown: watch::Receiver<bool>) -> Self {
+        Self {
+            config,
+            mqtt_client,
+            shutdown,
+            running: HashMap::new(),
+            tasks: JoinSet::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.running.is_empty()
+    }
+
+    /// Starts running a newly seen device. Devices we can't identify, and ones already
+    /// running, are ignored.
+    fn attach(&mut self, info: HidDeviceInfo) {
+        // A device whose task has already ended is not running anymore, even if we haven't
+        // got round to joining it yet, so don't let a stale entry block it from coming back
+        self.reap();
+
+        // The queries only match known devices, so this is mostly here to get the kind
+        let Some(kind) = Kind::from_vid_pid(info.vendor_id, info.product_id) else {
+            println!(
+                "Ignoring unsupported device {:04X}:{:04X}",
+                info.vendor_id, info.product_id
+            );
 
             return;
+        };
+
+        // Every supported device reports a serial, and we need one: it's how Home Assistant
+        // and the config tell two otherwise identical docks apart
+        let Some(serial) = info.serial_number.clone() else {
+            println!(
+                "Ignoring {} {} that reports no serial number",
+                kind.manufacturer(),
+                kind.model()
+            );
+
+            return;
+        };
+
+        // The same device can be reported twice, by the startup enumeration and by the
+        // watcher, and a device can expose more than one matching interface
+        if self.running.contains_key(&serial) {
+            return;
+        }
+
+        let handle = self.tasks.spawn(device::run(
+            info,
+            kind,
+            serial.clone(),
+            self.config.for_device(&serial),
+            self.mqtt_client.clone(),
+            self.shutdown.clone(),
+        ));
+
+        self.running.insert(serial, handle);
+    }
+
+    /// Stops running an unplugged device. There is no point shutting it down gracefully,
+    /// it's already gone.
+    fn detach(&mut self, info: &HidDeviceInfo) {
+        let Some(serial) = info.serial_number.as_deref() else {
+            return;
+        };
+
+        if let Some(handle) = self.running.remove(serial) {
+            println!("[{serial}] Unplugged");
+
+            handle.abort();
+        }
+    }
+
+    async fn join_next(&mut self) -> Option<()> {
+        self.tasks.join_next().await.map(|_| ())
+    }
+
+    /// Forgets the devices whose tasks have ended, so they can be attached again if they
+    /// come back
+    fn reap(&mut self) {
+        self.running.retain(|_, handle| !handle.is_finished());
+    }
+
+    /// Waits for the running devices to finish shutting down, but not forever: a device that
+    /// stopped responding shouldn't hold up the exit
+    async fn shutdown(mut self) {
+        let drain = async { while self.tasks.join_next().await.is_some() {} };
+
+        if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
+            println!("Giving up on devices that didn't shut down in time");
+
+            self.tasks.shutdown().await;
         }
     }
 }

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 dotenv = "0.15.0"
+futures-lite = "2.6.1"
 image = "0.25.9"
 mirajazz = "0.9.0"
 rumqttc = "0.25.1"

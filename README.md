@@ -11,6 +11,8 @@ This project allows you to use "Stream dock" devices such as the Mirabox N3 or t
 
 Connected devices are detected by their USB ID, so nothing has to be configured to pick a model. On the N1, buttons 15 and 16 are the two buttons above the LCD strip and have no screen of their own, and the LCD strip itself only shows images, it reports no input.
 
+Several devices can be connected at the same time, in any mix of models. Each one runs independently: it gets its own Home Assistant device, its own MQTT topic and its own section of the config, and a device that errors out or is unplugged doesn't disturb the others. Devices are also picked up and dropped while the app runs, so plugging one in doesn't need a restart.
+
 ## Before running the app
 
 To detect the device, you have to set some udev rules. Copy the included [40-headless-streamdock.rules](40-headless-streamdock.rules) into `/etc/udev/rules.d/` and run `sudo udevadm control --reload-rules`. The rules give the device to the `plugdev` group, so make sure the user running this program is a member of it (`sudo usermod -aG plugdev <user>`); the file also contains a `uaccess` variant for desktop use. Unplug and plug the device in again after this.
@@ -51,7 +53,36 @@ id = 0 # segment of the LCD strip, left to right
 icon = "clock.png"
 ```
 
-All images referenced in the config should be placed in the `images/` directory. Entries for buttons or LCD segments the connected device doesn't have (for example `id = 8` on a device whose screens stop at button 5) are skipped with a warning, so the same config file can be used with either model.
+All images referenced in the config should be placed in the `images/` directory. Entries for buttons or LCD segments the connected device doesn't have (for example `id = 8` on a device whose screens stop at button 5) are skipped with a warning, so the same config file can be used with either model. An icon that can't be read leaves that button blank, it doesn't stop the device.
+
+### Giving one device its own settings
+
+Everything above applies to every connected device. When you have more than one plugged in and they shouldn't all look the same, add a `[[devices]]` section keyed by the device's serial number:
+
+```toml
+brightness = 40
+timeout = 30
+
+[[buttons]]
+id = 0
+icon = "light.png"
+
+[[devices]]
+serial = "AL12345678" # serial number of the device this section applies to
+brightness = 80       # this dock is somewhere brighter
+
+[[devices.buttons]]
+id = 0
+icon = "candle.png"
+
+[[devices.lcd]]
+id = 0
+icon = "clock.png"
+```
+
+The serial number is the one the app prints when it connects (`[AL12345678] Connecting to ...`); it is also the `<serial>` in the MQTT topic and in the Home Assistant device name.
+
+Anything a `[[devices]]` section leaves out falls back to the top level, so a device that only needs a different brightness only has to set `brightness`. The `buttons` and `lcd` lists are the exception: if a section lists any, they *replace* the top-level list for that device rather than being merged into it, so the section describes everything that device shows. Use `buttons = []` to give a device no icons at all.
 
 ## Setting up automations in Home Assistant
 
@@ -62,6 +93,8 @@ Creating a separate automation per button gets unwieldy quickly, though, so blue
 1. Settings -> Automations -> Blueprints -> Import Blueprint, and point it at the raw contents of the blueprint for your device (or copy the file into your `config/blueprints/automation/<name>/` folder and reload blueprints).
 2. Create a new automation from the imported blueprint.
 3. Fill in the trigger topic (`streamdock/<serial>/trigger`, visible in the device's MQTT discovery config) and an action for each button/knob you want to use; unused ones can stay empty.
+
+Because the topic is per device, several connected devices each get their own automation created from the same blueprint, one per serial number.
 
 ## Compatibility
 
@@ -77,6 +110,8 @@ Which means `vendor_id = 0x6603` and `product_id = 0x1003`. If the device is rec
 
 - Register buttons and knobs as Home Assistant MQTT device triggers, so actions are defined via HA automations
 - Support for multiple device models, detected automatically by USB ID
+- Run several devices at once, each with its own HA device and optionally its own settings
+- Pick up devices as they are plugged in and drop them as they are unplugged, without a restart
 - Includes [blueprints](blueprints/) to map all buttons/knobs in a single automation
 - Set custom pictures for buttons with screens, and for the LCD strip on devices that have one
 - Configure timeout for screens
