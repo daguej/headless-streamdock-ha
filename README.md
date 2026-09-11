@@ -86,7 +86,7 @@ Anything a `[[devices]]` section leaves out falls back to the top level, so a de
 
 ## Controlling the screens from Home Assistant
 
-Every screen the connected device has gets a text entity named after it ("Button 0 image", "LCD segment 0 image"), listed under Configuration on the device page. Typing the name of a file from `images/` into one sets that screen, and emptying the field blanks it, so the screens can be changed from a dashboard without touching the config file.
+Every screen the connected device has gets a text entity named after it ("Button 0 image", "LCD segment 0 image"), listed under Configuration on the device page alongside the [screen timeout switch](#keeping-the-screens-lit). Typing the name of a file from `images/` into one sets that screen, and emptying the field blanks it, so the screens can be changed from a dashboard without touching the config file.
 
 The entity's value is also what the screen is showing right now, and it is published retained, so it stays right across a Home Assistant restart.
 
@@ -146,6 +146,36 @@ Because a screen showing an image that arrived over MQTT has no file name to rep
 
 Two smaller things worth knowing: an image sent while the screens have dimmed is drawn but stays dim until the next button press, and a command for a screen the connected device doesn't have is logged and ignored, the same way the config entries are.
 
+## Keeping the screens lit
+
+`timeout` in `config.toml` decides how long a device may sit untouched before its screens dim. For a dock that should stay lit regardless — one showing a dashboard rather than waiting to be pressed — each device also gets a "Screen timeout" switch, listed under Configuration on the device page next to the image entities.
+
+Turning it off keeps the screens lit however long the device is left alone, and brings screens that have already dimmed straight back up. Turning it back on starts the idle period over, so the screens get another `timeout` seconds before they dim rather than going dark the moment the switch flips.
+
+### Switching it from an automation
+
+The switch is backed by one MQTT topic per device, like the screens:
+
+| Topic | What it does |
+| --- | --- |
+| `streamdock/<serial>/timeout/set` | `ON` lets the screens dim after `timeout` seconds, `OFF` keeps them lit |
+| `streamdock/<serial>/timeout` | Reports which of the two it currently is (published by the app, don't write to it) |
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: binary_sensor.kitchen_presence
+    to: "on"
+actions:
+  - action: mqtt.publish
+    data:
+      topic: streamdock/AL12345678/timeout/set
+      retain: true
+      payload: "OFF"
+```
+
+`ON` and `OFF` are what Home Assistant sends, and `true`/`false` and `1`/`0` are accepted too, in any case. Publish with `retain: true` (which the switch does for you) and the setting survives a restart of either side, exactly as the images do; without it the screens dim again as soon as the device next reconnects. A payload that is neither on nor off is logged and ignored, leaving the setting as it was.
+
 ## Setting up automations in Home Assistant
 
 Once the app is running and connected to your MQTT broker, it publishes discovery data and a new device named "Stream Dock (...)" appears under Settings -> Devices & Services -> MQTT. From there you can build one "Device" automation per button/knob trigger (Settings -> Automations -> Add Automation -> When -> Device -> select the Stream Dock device -> pick a trigger such as "Button 1 pressed" or "Knob 0 rotated left/right").
@@ -177,5 +207,5 @@ Which means `vendor_id = 0x6603` and `product_id = 0x1003`. If the device is rec
 - Includes [blueprints](blueprints/) to map all buttons/knobs in a single automation
 - Set custom pictures for buttons with screens, and for the LCD strip on devices that have one
 - Change any screen from Home Assistant while running, either by naming a file or by sending the image itself over MQTT
-- Configure timeout for screens
+- Configure timeout for screens, and turn it off from Home Assistant while running to keep a device lit
 - Configure screen brightness

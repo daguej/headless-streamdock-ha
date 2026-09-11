@@ -12,7 +12,7 @@ use crate::{
     config::DeviceConfig,
     icons::{self, Icon},
     mappings::{Kind, Screen},
-    mqtt::{self, MqttEvent},
+    mqtt::{self, Command, MqttEvent},
 };
 
 /// Drives a single device from connect to disconnect. Anything that goes wrong with one device
@@ -101,28 +101,44 @@ async fn session(
     // Flush
     device.flush().await?;
 
-    // Only ask for the images Home Assistant has retained once the configured ones are on the
+    // The screens dim on their own until Home Assistant says otherwise, which a retained command
+    // on the subscription below does as soon as it arrives
+    let (timeout, mut timeout_changes) = watch::channel(true);
+    mqtt::publish_timeout_state(mqtt_client, serial, true).await;
+
+    // Only ask for the commands Home Assistant has retained once the configured images are on the
     // device, so they arrive afterwards and take over rather than being overwritten
-    mqtt::subscribe_images(mqtt_client, serial).await;
+    mqtt::subscribe_commands(mqtt_client, serial).await;
 
     let reader = device.get_reader(kind.process_input());
 
+    let input = input_loop(
+        device,
+        &reader,
+        serial,
+        config,
+        mqtt_client,
+        &mut timeout_changes,
+    );
+    let commands = command_loop(device, kind, serial, mqtt_client, mqtt_events, &timeout);
+
     tokio::select! {
-        result = input_loop(device, &reader, serial, config, mqtt_client) => result,
-        result = image_loop(device, kind, serial, mqtt_client, mqtt_events) => result,
+        result = input => result,
+        result = commands => result,
         result = keepalive_loop(device, kind) => result,
         _ = cancelled(&mut shutdown) => Ok(()),
     }
 }
 
-/// Puts the images Home Assistant sends onto the screens they address, for as long as the device
-/// is connected
-async fn image_loop(
+/// Carries out what Home Assistant asks of the device for as long as it is connected: the images
+/// to put on the screens it addresses, and whether those screens may dim
+async fn command_loop(
     device: &Device,
     kind: Kind,
     serial: &str,
     mqtt_client: &AsyncClient,
     events: &mut broadcast::Receiver<MqttEvent>,
+    timeout: &watch::Sender<bool>,
 ) -> Result<(), MirajazzError> {
     use broadcast::error::RecvError;
 
@@ -130,15 +146,24 @@ async fn image_loop(
         match events.recv().await {
             Ok(MqttEvent::Message(publish)) => {
                 // Every device sees every message, so most of them are somebody else's
-                if let Some((screen, payload)) = mqtt::image_command(&publish, serial) {
-                    set_image(device, kind, serial, mqtt_client, screen, payload).await?;
+                match mqtt::command(&publish, serial) {
+                    Some(Command::Image(screen, payload)) => {
+                        set_image(device, kind, serial, mqtt_client, screen, payload).await?;
+                    }
+                    Some(Command::Timeout(enabled)) => {
+                        set_timeout(serial, mqtt_client, timeout, enabled).await;
+                    }
+                    None => {}
                 }
             }
             Ok(MqttEvent::Connected) => {
-                // A reconnected session has none of our subscriptions, and a broker that was
-                // restarted without persistence has none of our discovery configs either
+                // A reconnected session has none of our subscriptions, and a broker restarted
+                // without persistence has none of our discovery configs or states either
+                let enabled = *timeout.borrow();
+
                 mqtt::publish_discovery(mqtt_client, serial, kind).await;
-                mqtt::subscribe_images(mqtt_client, serial).await;
+                mqtt::publish_timeout_state(mqtt_client, serial, enabled).await;
+                mqtt::subscribe_commands(mqtt_client, serial).await;
             }
             // Images are big, so only a few are kept waiting. Dropping the ones this device
             // couldn't keep up with is better than holding on to megabytes of stale pictures.
@@ -153,28 +178,54 @@ async fn image_loop(
 }
 
 /// Reads input for as long as the device keeps talking to us, dimming the screens after the
-/// configured period of inactivity and restoring them on the next input
+/// configured period of inactivity and restoring them on the next input.
+///
+/// While the timeout is switched off the screens are left lit however long the device sits
+/// untouched, and switching it off wakes screens that have already dimmed.
 async fn input_loop(
     device: &Device,
     reader: &DeviceStateReader,
     serial: &str,
     config: &DeviceConfig,
     mqtt_client: &AsyncClient,
+    timeout_changes: &mut watch::Receiver<bool>,
 ) -> Result<(), MirajazzError> {
     use tokio::time::{Duration, Instant, timeout_at};
 
-    // We dim after `timeout` seconds of inactivity.
+    // We dim after `timeout` seconds of inactivity, unless the timeout is switched off.
     let idle_timeout = Duration::from_secs(config.timeout);
     let mut is_dimmed = false;
     let mut idle_deadline = Instant::now() + idle_timeout;
 
     loop {
-        // While the screens are lit, stop waiting at the idle deadline so we can dim.
-        // Once dimmed there is nothing to wait for but the next input.
-        let result = if is_dimmed {
-            Ok(reader.read(None).await)
-        } else {
-            timeout_at(idle_deadline, reader.read(None)).await
+        // While the screens are lit and the timeout is on, stop waiting at the idle deadline
+        // so we can dim. Once dimmed, or with the timeout off, there is nothing to wait for
+        // but the next input, or for the setting to change under us.
+        let dims = !is_dimmed && *timeout_changes.borrow_and_update();
+
+        let result = tokio::select! {
+            // Input that has already been read is worth more than being prompt about a setting
+            // that is only ever changed by hand, so never drop a read in favour of a change
+            biased;
+
+            result = async {
+                if dims {
+                    timeout_at(idle_deadline, reader.read(None)).await
+                } else {
+                    Ok(reader.read(None).await)
+                }
+            } => result,
+            enabled = timeout_changed(timeout_changes) => {
+                if enabled {
+                    // A timeout just switched on counts the idle period from now, rather than
+                    // dimming straight away because the device had been sitting idle
+                    idle_deadline = Instant::now() + idle_timeout;
+                } else if is_dimmed && wake(device, serial, config).await {
+                    is_dimmed = false;
+                }
+
+                continue;
+            }
         };
 
         let updates = match result {
@@ -187,10 +238,9 @@ async fn input_loop(
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 if !is_dimmed {
-                    if let Err(e) = device.sleep().await {
-                        println!("[{serial}] Failed to dim brightness: {e}");
-                    } else {
-                        is_dimmed = true;
+                    match device.sleep().await {
+                        Ok(()) => is_dimmed = true,
+                        Err(e) => println!("[{serial}] Failed to dim brightness: {e}"),
                     }
                 }
                 continue;
@@ -204,12 +254,8 @@ async fn input_loop(
         }
 
         // We got some updates: ensure brightness is restored if we were dimmed.
-        if is_dimmed {
-            if let Err(e) = device.set_brightness(config.brightness).await {
-                println!("[{serial}] Failed to restore brightness: {e}");
-            } else {
-                is_dimmed = false;
-            }
+        if is_dimmed && wake(device, serial, config).await {
+            is_dimmed = false;
         }
 
         idle_deadline = Instant::now() + idle_timeout;
@@ -230,6 +276,58 @@ async fn input_loop(
             }
         }
     }
+}
+
+/// Brings the screens back up after they dimmed, and says whether they are lit now, so a device
+/// that wouldn't come back is tried again on the next input rather than left dim for good
+async fn wake(device: &Device, serial: &str, config: &DeviceConfig) -> bool {
+    match device.set_brightness(config.brightness).await {
+        Ok(()) => true,
+        Err(e) => {
+            println!("[{serial}] Failed to restore brightness: {e}");
+
+            false
+        }
+    }
+}
+
+/// Yields the screen timeout setting every time it changes, and never again once nothing can
+/// change it, so it can always be selected over
+async fn timeout_changed(timeout: &mut watch::Receiver<bool>) -> bool {
+    if timeout.changed().await.is_err() {
+        return std::future::pending().await;
+    }
+
+    *timeout.borrow_and_update()
+}
+
+/// Switches the screen timeout on or off, and reports it back. The input loop is what acts on it:
+/// it owns both the idle deadline and the brightness.
+async fn set_timeout(
+    serial: &str,
+    mqtt_client: &AsyncClient,
+    timeout: &watch::Sender<bool>,
+    enabled: bool,
+) {
+    // A command that says what the setting already is happens on every reconnect, when the broker
+    // replays the retained one, and isn't worth waking the input loop or Home Assistant for
+    let changed = timeout.send_if_modified(|current| {
+        let changed = *current != enabled;
+        *current = enabled;
+
+        changed
+    });
+
+    if !changed {
+        return;
+    }
+
+    println!(
+        "[{serial}] Screen timeout {}",
+        if enabled { "enabled" } else { "disabled" }
+    );
+
+    mqtt::publish_timeout_state(mqtt_client, serial, enabled).await;
 }
 
 /// Pings devices that drop the connection when idle. Never returns for devices that don't

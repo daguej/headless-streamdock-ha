@@ -4,7 +4,10 @@ use serde_json::json;
 use std::{env::var, time::Duration};
 use tokio::{sync::broadcast, task::JoinHandle};
 
-use crate::mappings::{Kind, Screen};
+use crate::{
+    icons::Shortened,
+    mappings::{Kind, Screen},
+};
 
 /// Root of every topic this app uses, both the ones it publishes and the ones it listens on
 const TOPIC_ROOT: &str = "streamdock";
@@ -22,6 +25,23 @@ const EVENT_CAPACITY: usize = 64;
 
 /// How long to wait before reconnecting after the MQTT connection fails
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+/// Identifies the screen timeout entity within its device
+const TIMEOUT_OBJECT_ID: &str = "screen_timeout";
+
+/// What Home Assistant's switch sends and expects by default, and what this app reports
+const PAYLOAD_ON: &str = "ON";
+const PAYLOAD_OFF: &str = "OFF";
+
+/// What an incoming message asks a device to do
+#[derive(Debug, PartialEq)]
+pub enum Command<'a> {
+    /// Show this image on one of the device's screens
+    Image(Screen, &'a [u8]),
+    /// Let the screens dim after the configured idle period, or keep them lit however long the
+    /// device sits untouched
+    Timeout(bool),
+}
 
 /// Something that happened on the MQTT connection and that the devices need to know about
 #[derive(Debug, Clone)]
@@ -111,6 +131,16 @@ fn image_command_topic(device_id: &str, screen: Screen) -> String {
     format!("{}/set", image_topic(device_id, screen))
 }
 
+/// Where it is reported whether the screens dim on their own
+fn timeout_topic(device_id: &str) -> String {
+    format!("{TOPIC_ROOT}/{device_id}/timeout")
+}
+
+/// Where the screen timeout is turned on and off
+fn timeout_command_topic(device_id: &str) -> String {
+    format!("{}/set", timeout_topic(device_id))
+}
+
 /// Identifies a screen's entity within its device
 fn image_object_id(screen: Screen) -> String {
     match screen {
@@ -120,8 +150,9 @@ fn image_object_id(screen: Screen) -> String {
 }
 
 // Publishes retained HA MQTT discovery configs for one device: a device-automation trigger per
-// button and three (rotate_left/rotate_right/press) per knob, plus a text entity per screen to
-// set the image it shows. How many of each there are depends on the model of the device.
+// button and three (rotate_left/rotate_right/press) per knob, a text entity per screen to set the
+// image it shows, and a switch for the screen timeout. How many of each there are depends on the
+// model of the device.
 pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind) {
     let prefix = discovery_prefix();
     let topic = trigger_topic(device_id);
@@ -200,6 +231,31 @@ pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind
 
         publish_discovery_config(client, &prefix, "text", device_id, &object_id, &payload).await;
     }
+
+    // Retained for the same reason the images are: it is the retained command that brings the
+    // setting back when either side restarts, rather than it reverting to dimming again
+    let payload = json!({
+        "name": "Screen timeout",
+        "unique_id": format!("{TOPIC_ROOT}_{device_id}_{TIMEOUT_OBJECT_ID}"),
+        "command_topic": timeout_command_topic(device_id),
+        "state_topic": timeout_topic(device_id),
+        "payload_on": PAYLOAD_ON,
+        "payload_off": PAYLOAD_OFF,
+        "retain": true,
+        "entity_category": "config",
+        "icon": "mdi:timer-outline",
+        "device": device,
+    });
+
+    publish_discovery_config(
+        client,
+        &prefix,
+        "switch",
+        device_id,
+        TIMEOUT_OBJECT_ID,
+        &payload,
+    )
+    .await;
 }
 
 async fn publish_discovery_config(
@@ -217,26 +273,70 @@ async fn publish_discovery_config(
         .unwrap_or_else(|_| println!("Failed to publish discovery config for {object_id}"));
 }
 
-/// Asks for the image commands addressed to one device.
+/// Asks for the commands addressed to one device: the images for its screens and the state of its
+/// screen timeout.
 ///
 /// This has to be repeated on every new connection, because an MQTT session starts with no
-/// subscriptions. The broker replays the retained images each time, which is what restores the
-/// screens after this app restarts or the connection drops.
-pub async fn subscribe_images(client: &AsyncClient, device_id: &str) {
-    // One filter covers every screen: the commands only differ in the button/lcd path
-    let filter = format!("{TOPIC_ROOT}/{device_id}/+/+/image/set");
+/// subscriptions. The broker replays the retained commands each time, which is what restores the
+/// screens and the timeout setting after this app restarts or the connection drops.
+pub async fn subscribe_commands(client: &AsyncClient, device_id: &str) {
+    // One filter covers every screen: the image commands only differ in the button/lcd path
+    let filters = [
+        format!("{TOPIC_ROOT}/{device_id}/+/+/image/set"),
+        timeout_command_topic(device_id),
+    ];
 
-    if let Err(e) = client.subscribe(&filter, QoS::AtLeastOnce).await {
-        println!("[{device_id}] Failed to subscribe to {filter}: {e}");
+    for filter in filters {
+        if let Err(e) = client.subscribe(&filter, QoS::AtLeastOnce).await {
+            println!("[{device_id}] Failed to subscribe to {filter}: {e}");
+        }
     }
 }
 
-/// Picks out the screen an incoming message addresses, and the image data it carries. Messages
-/// for another device, or on a topic that isn't an image command, are not ours to handle.
-pub fn image_command<'a>(publish: &'a Publish, device_id: &str) -> Option<(Screen, &'a [u8])> {
-    let screen = parse_image_command(&publish.topic, device_id)?;
+/// Picks out what an incoming message asks one device to do. Messages for another device, and
+/// ones on a topic that isn't a command, are not ours to handle.
+pub fn command<'a>(publish: &'a Publish, device_id: &str) -> Option<Command<'a>> {
+    parse_command(&publish.topic, &publish.payload, device_id)
+}
 
-    Some((screen, &publish.payload))
+fn parse_command<'a>(topic: &str, payload: &'a [u8], device_id: &str) -> Option<Command<'a>> {
+    if let Some(screen) = parse_image_command(topic, device_id) {
+        return Some(Command::Image(screen, payload));
+    }
+
+    if topic == timeout_command_topic(device_id) {
+        return parse_timeout(payload, device_id).map(Command::Timeout);
+    }
+
+    None
+}
+
+/// Reads an on/off payload, accepting the spellings Home Assistant and the command line both
+/// use. An empty payload is a retained command being cleared rather than a setting, so it says
+/// nothing about what the timeout should be.
+fn parse_timeout(payload: &[u8], device_id: &str) -> Option<bool> {
+    let Ok(text) = str::from_utf8(payload) else {
+        println!("[{device_id}] Ignoring a screen timeout command that isn't text");
+
+        return None;
+    };
+
+    let command = text.trim();
+
+    match command.to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" => Some(true),
+        "off" | "false" | "0" => Some(false),
+        "" => None,
+        _ => {
+            println!(
+                "[{device_id}] Ignoring screen timeout command '{}', expected {PAYLOAD_ON} or \
+                 {PAYLOAD_OFF}",
+                Shortened(command)
+            );
+
+            None
+        }
+    }
 }
 
 fn parse_image_command(topic: &str, device_id: &str) -> Option<Screen> {
@@ -277,6 +377,18 @@ pub async fn publish_image_state(
         )
         .await
         .unwrap_or_else(|_| println!("[{device_id}] Failed to publish the state of {screen}"));
+}
+
+/// Reports whether the screens dim on their own, so the Home Assistant switch matches the device.
+/// Retained, like the image states, so it is still right for a Home Assistant that restarts while
+/// this app keeps running.
+pub async fn publish_timeout_state(client: &AsyncClient, device_id: &str, enabled: bool) {
+    let payload = if enabled { PAYLOAD_ON } else { PAYLOAD_OFF };
+
+    client
+        .publish(timeout_topic(device_id), QoS::AtLeastOnce, true, payload)
+        .await
+        .unwrap_or_else(|_| println!("[{device_id}] Failed to publish the screen timeout state"));
 }
 
 pub async fn handle_button(client: &AsyncClient, device_id: &str, i: u8) {
@@ -334,6 +446,65 @@ mod tests {
     }
 
     #[test]
+    fn the_timeout_command_is_not_mistaken_for_an_image() {
+        let topic = timeout_command_topic(SERIAL);
+
+        // Both subscriptions feed the same parser, so the image filter's `+/+` must not swallow
+        // the timeout topic and vice versa
+        assert_eq!(parse_image_command(&topic, SERIAL), None);
+        assert_eq!(
+            parse_command(&topic, b"OFF", SERIAL),
+            Some(Command::Timeout(false))
+        );
+
+        let image = image_command_topic(SERIAL, Screen::Button(0));
+        assert_eq!(
+            parse_command(&image, b"light.png", SERIAL),
+            Some(Command::Image(Screen::Button(0), b"light.png"))
+        );
+    }
+
+    #[test]
+    fn the_timeout_takes_the_spellings_home_assistant_and_a_shell_send() {
+        for payload in ["ON", "on", "true", "1", " ON\n"] {
+            assert_eq!(
+                parse_timeout(payload.as_bytes(), SERIAL),
+                Some(true),
+                "'{payload}' should have switched the timeout on"
+            );
+        }
+
+        for payload in ["OFF", "off", "false", "0", " OFF\n"] {
+            assert_eq!(
+                parse_timeout(payload.as_bytes(), SERIAL),
+                Some(false),
+                "'{payload}' should have switched the timeout off"
+            );
+        }
+    }
+
+    #[test]
+    fn a_timeout_payload_that_says_nothing_leaves_the_setting_alone() {
+        for payload in [
+            // A retained command being cleared, which is not a request to stop dimming
+            &b""[..],
+            &b"  "[..],
+            &b"yes"[..],
+            // Not text at all, such as an image sent to the wrong topic
+            &[0xff, 0xfe][..],
+        ] {
+            assert_eq!(parse_timeout(payload, SERIAL), None);
+        }
+    }
+
+    #[test]
+    fn a_timeout_command_for_another_device_is_not_ours() {
+        let topic = timeout_command_topic("CL87654321");
+
+        assert_eq!(parse_command(&topic, b"OFF", SERIAL), None);
+    }
+
+    #[test]
     fn the_state_topic_is_not_the_command_topic() {
         // Otherwise reporting a screen's state would immediately look like a new command
         let screen = Screen::Button(0);
@@ -346,6 +517,11 @@ mod tests {
             parse_image_command(&image_topic(SERIAL, screen), SERIAL),
             None
         );
+
+        // And the same for the timeout, where reporting the state back as a command would be a
+        // loop rather than just a wrong screen
+        assert_ne!(timeout_topic(SERIAL), timeout_command_topic(SERIAL));
+        assert_eq!(parse_command(&timeout_topic(SERIAL), b"OFF", SERIAL), None);
     }
 
     #[test]

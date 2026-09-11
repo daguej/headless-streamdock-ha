@@ -122,8 +122,9 @@ impl fmt::Display for Error {
     }
 }
 
-/// Prints the start of a name that is too long to belong in a log line
-struct Shortened<'a>(&'a str);
+/// Prints the start of a payload that is too long to belong in a log line, so a message someone
+/// sent by mistake is still reported without a picture's worth of it ending up in the log
+pub struct Shortened<'a>(pub &'a str);
 
 impl fmt::Display for Shortened<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
