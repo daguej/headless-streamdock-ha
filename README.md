@@ -33,7 +33,7 @@ MQTT_PASSWORD="verysecretpassword" # optional
 MQTT_DISCOVERY_PREFIX="homeassistant" # optional, only needed if you changed HA's default discovery prefix
 ```
 
-`config.toml` contains general configuration (brightness, timeout) and optional button icons. Buttons and knobs work as triggers even when not listed here; the only thing a `[[buttons]]` entry adds is an image set on the device's screen. Knobs need no configuration at all.
+`config.toml` contains general configuration (brightness, timeout) and optional button icons. Buttons and knobs work as triggers even when not listed here; the only thing a `[[buttons]]` entry adds is the image a screen starts out with. Once the app is running, Home Assistant can change any screen at any time (see [Controlling the screens from Home Assistant](#controlling-the-screens-from-home-assistant)), so these entries are the fallback the device shows before Home Assistant has said otherwise. Knobs need no configuration at all.
 
 ```toml
 brightness = 40 # key screen brightness, 0-100
@@ -84,6 +84,68 @@ The serial number is the one the app prints when it connects (`[AL12345678] Conn
 
 Anything a `[[devices]]` section leaves out falls back to the top level, so a device that only needs a different brightness only has to set `brightness`. The `buttons` and `lcd` lists are the exception: if a section lists any, they *replace* the top-level list for that device rather than being merged into it, so the section describes everything that device shows. Use `buttons = []` to give a device no icons at all.
 
+## Controlling the screens from Home Assistant
+
+Every screen the connected device has gets a text entity named after it ("Button 0 image", "LCD segment 0 image"), listed under Configuration on the device page. Typing the name of a file from `images/` into one sets that screen, and emptying the field blanks it, so the screens can be changed from a dashboard without touching the config file.
+
+The entity's value is also what the screen is showing right now, and it is published retained, so it stays right across a Home Assistant restart.
+
+### From an automation
+
+The entities are backed by one MQTT topic per screen, which an automation can publish to directly:
+
+| Topic | What it does |
+| --- | --- |
+| `streamdock/<serial>/button/<id>/image/set` | Sets the image on a button's screen |
+| `streamdock/<serial>/lcd/<id>/image/set` | Sets the image on an LCD strip segment |
+| `streamdock/<serial>/button/<id>/image` | Reports what that button is showing (published by the app, don't write to it) |
+
+The payload can be any of:
+
+- the name of a file in `images/`, such as `light.png`
+- base64 encoded image data, optionally as a `data:image/png;base64,...` URI and optionally wrapped across lines, which is what a Home Assistant template can produce
+- raw image bytes, which is what `mosquitto_pub -f` sends
+- nothing at all, which blanks the screen
+
+Whichever it is is worked out from the payload itself, so the same topic takes all of them. Any format the [image](https://crates.io/crates/image) crate reads works (PNG, JPEG, GIF, WebP, BMP and more); it is resized to the screen automatically. A message may be up to 512 KiB.
+
+Picking an icon by name is the usual case, and an ordinary automation covers it:
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: light.kitchen
+actions:
+  - action: mqtt.publish
+    data:
+      topic: streamdock/AL12345678/button/0/image/set
+      retain: true
+      payload: "{{ 'light-on.png' if is_state('light.kitchen', 'on') else 'light-off.png' }}"
+```
+
+An image generated elsewhere is published the same way, as base64:
+
+```yaml
+  - action: mqtt.publish
+    data:
+      topic: streamdock/AL12345678/button/1/image/set
+      payload: "{{ state_attr('sensor.doorbell_thumbnail', 'image_base64') }}"
+```
+
+Or, from anything that can talk to the broker, as the bytes of a file:
+
+```bash
+mosquitto_pub -h localhost -t 'streamdock/AL12345678/button/0/image/set' -f new-icon.png -r
+```
+
+### Making images stick
+
+Publish with `retain: true` (which the text entities do for you) and the broker hands the image back every time this app reconnects, so the screens come back as they were after a restart of either side, of the broker, or after unplugging the dock. Without it, an image lasts only until the device next reconnects, and the screen then falls back to whatever `config.toml` gives it.
+
+Because a screen showing an image that arrived over MQTT has no file name to report, its entity reads `<image>` instead. Submitting that unchanged does nothing, so the screen isn't cleared by looking at it.
+
+Two smaller things worth knowing: an image sent while the screens have dimmed is drawn but stays dim until the next button press, and a command for a screen the connected device doesn't have is logged and ignored, the same way the config entries are.
+
 ## Setting up automations in Home Assistant
 
 Once the app is running and connected to your MQTT broker, it publishes discovery data and a new device named "Stream Dock (...)" appears under Settings -> Devices & Services -> MQTT. From there you can build one "Device" automation per button/knob trigger (Settings -> Automations -> Add Automation -> When -> Device -> select the Stream Dock device -> pick a trigger such as "Button 1 pressed" or "Knob 0 rotated left/right").
@@ -114,5 +176,6 @@ Which means `vendor_id = 0x6603` and `product_id = 0x1003`. If the device is rec
 - Pick up devices as they are plugged in and drop them as they are unplugged, without a restart
 - Includes [blueprints](blueprints/) to map all buttons/knobs in a single automation
 - Set custom pictures for buttons with screens, and for the LCD strip on devices that have one
+- Change any screen from Home Assistant while running, either by naming a file or by sending the image itself over MQTT
 - Configure timeout for screens
 - Configure screen brightness

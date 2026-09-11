@@ -30,6 +30,15 @@ pub enum Kind {
     VsdInsideN1,
 }
 
+/// Somewhere an image can be shown: the screen in a button, or one segment of the LCD strip.
+/// Which of these a device actually has depends on its [`Kind`], so a screen only becomes a
+/// hardware image id by way of [`Kind::resolve_screen`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Screen {
+    Button(u8),
+    Lcd(u8),
+}
+
 impl Kind {
     /// Matches a device's VID+PID pair to the correct kind
     pub fn from_vid_pid(vid: u16, pid: u16) -> Option<Self> {
@@ -134,6 +143,28 @@ impl Kind {
         }
     }
 
+    /// Every screen this model has, buttons first and then the LCD strip
+    pub fn screens(&self) -> Vec<Screen> {
+        let buttons = (0..self.screen_key_count() as u8).map(Screen::Button);
+        let lcd = (0..self.lcd_segment_count() as u8).map(Screen::Lcd);
+
+        buttons.chain(lcd).collect()
+    }
+
+    /// The hardware image id and image format to use for a screen, or `None` when this model
+    /// doesn't have that screen
+    pub fn resolve_screen(&self, screen: Screen) -> Option<(u8, ImageFormat)> {
+        match screen {
+            Screen::Button(id) if (id as usize) < self.screen_key_count() => {
+                Some((id, self.image_format()))
+            }
+            Screen::Button(_) => None,
+            Screen::Lcd(id) => self
+                .lcd_hw_key(id)
+                .map(|key| (key, self.lcd_image_format())),
+        }
+    }
+
     /// Some devices ignore every other command until they are put into the right mode
     pub fn startup_mode(&self) -> Option<u8> {
         match self {
@@ -169,6 +200,17 @@ impl Kind {
 
     pub fn knob_label(&self, id: u8) -> String {
         format!("Knob {id}")
+    }
+}
+
+/// Names a screen the way it is shown to the user, both in log lines and as the Home Assistant
+/// entity it is controlled through
+impl std::fmt::Display for Screen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Screen::Button(id) => write!(f, "Button {id}"),
+            Screen::Lcd(id) => write!(f, "LCD segment {id}"),
+        }
     }
 }
 
@@ -209,5 +251,47 @@ mod tests {
         // The N3 has no LCD strip at all
         assert_eq!(Kind::MiraboxN3.lcd_segment_count(), 0);
         assert_eq!(Kind::MiraboxN3.lcd_hw_key(0), None);
+    }
+
+    #[test]
+    fn screens_are_listed_buttons_first() {
+        assert_eq!(
+            Kind::MiraboxN3.screens(),
+            (0..6).map(Screen::Button).collect::<Vec<_>>()
+        );
+
+        let n1 = Kind::VsdInsideN1.screens();
+        assert_eq!(n1.len(), 18);
+        assert_eq!(n1[0], Screen::Button(0));
+        assert_eq!(n1[14], Screen::Button(14));
+        assert_eq!(n1[15], Screen::Lcd(0));
+        assert_eq!(n1[17], Screen::Lcd(2));
+    }
+
+    #[test]
+    fn only_screens_a_model_has_resolve_to_a_hardware_id() {
+        let hw_key = |kind: Kind, screen| kind.resolve_screen(screen).map(|(key, _)| key);
+
+        // Buttons with a screen use their own id, LCD segments continue after them
+        assert_eq!(hw_key(Kind::VsdInsideN1, Screen::Button(14)), Some(14));
+        assert_eq!(hw_key(Kind::VsdInsideN1, Screen::Lcd(0)), Some(15));
+
+        // Buttons 15 and 16 exist on the N1 but have no screen of their own
+        assert_eq!(hw_key(Kind::VsdInsideN1, Screen::Button(15)), None);
+        // And the N3 has neither that many buttons nor an LCD strip
+        assert_eq!(hw_key(Kind::MiraboxN3, Screen::Button(6)), None);
+        assert_eq!(hw_key(Kind::MiraboxN3, Screen::Lcd(0)), None);
+    }
+
+    #[test]
+    fn every_screen_a_model_lists_can_be_resolved() {
+        for kind in [Kind::MiraboxN3, Kind::VsdInsideN1] {
+            for screen in kind.screens() {
+                assert!(
+                    kind.resolve_screen(screen).is_some(),
+                    "{kind:?} lists {screen} but cannot resolve it"
+                );
+            }
+        }
     }
 }

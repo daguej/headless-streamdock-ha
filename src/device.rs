@@ -1,4 +1,3 @@
-use image::{DynamicImage, open};
 use mirajazz::{
     device::Device,
     error::MirajazzError,
@@ -6,10 +5,15 @@ use mirajazz::{
     types::HidDeviceInfo,
 };
 use rumqttc::AsyncClient;
-use std::time::Duration;
-use tokio::sync::watch;
+use std::{collections::HashMap, time::Duration};
+use tokio::sync::{broadcast, watch};
 
-use crate::{config::DeviceConfig, mappings::Kind, mqtt};
+use crate::{
+    config::DeviceConfig,
+    icons::{self, Icon},
+    mappings::{Kind, Screen},
+    mqtt::{self, MqttEvent},
+};
 
 /// Drives a single device from connect to disconnect. Anything that goes wrong with one device
 /// is reported and ends only its own session, so the other connected devices keep running.
@@ -22,6 +26,7 @@ pub async fn run(
     serial: String,
     config: DeviceConfig,
     mqtt_client: AsyncClient,
+    mut mqtt_events: broadcast::Receiver<MqttEvent>,
     shutdown: watch::Receiver<bool>,
 ) {
     println!(
@@ -50,7 +55,17 @@ pub async fn run(
 
     mqtt::publish_discovery(&mqtt_client, &serial, kind).await;
 
-    if let Err(e) = session(&device, kind, &serial, &config, &mqtt_client, shutdown).await {
+    let session = session(
+        &device,
+        kind,
+        &serial,
+        &config,
+        &mqtt_client,
+        &mut mqtt_events,
+        shutdown,
+    );
+
+    if let Err(e) = session.await {
         println!("[{serial}] Session ended: {e}");
     }
 
@@ -69,6 +84,7 @@ async fn session(
     serial: &str,
     config: &DeviceConfig,
     mqtt_client: &AsyncClient,
+    mqtt_events: &mut broadcast::Receiver<MqttEvent>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), MirajazzError> {
     // Some devices ignore every other command until they are put into the right mode
@@ -80,17 +96,59 @@ async fn session(
     device.clear_all_button_images().await?;
 
     // Write the configured images to the device
-    set_images(device, kind, serial, config).await?;
+    set_images(device, kind, serial, config, mqtt_client).await?;
 
     // Flush
     device.flush().await?;
+
+    // Only ask for the images Home Assistant has retained once the configured ones are on the
+    // device, so they arrive afterwards and take over rather than being overwritten
+    mqtt::subscribe_images(mqtt_client, serial).await;
 
     let reader = device.get_reader(kind.process_input());
 
     tokio::select! {
         result = input_loop(device, &reader, serial, config, mqtt_client) => result,
+        result = image_loop(device, kind, serial, mqtt_client, mqtt_events) => result,
         result = keepalive_loop(device, kind) => result,
         _ = cancelled(&mut shutdown) => Ok(()),
+    }
+}
+
+/// Puts the images Home Assistant sends onto the screens they address, for as long as the device
+/// is connected
+async fn image_loop(
+    device: &Device,
+    kind: Kind,
+    serial: &str,
+    mqtt_client: &AsyncClient,
+    events: &mut broadcast::Receiver<MqttEvent>,
+) -> Result<(), MirajazzError> {
+    use broadcast::error::RecvError;
+
+    loop {
+        match events.recv().await {
+            Ok(MqttEvent::Message(publish)) => {
+                // Every device sees every message, so most of them are somebody else's
+                if let Some((screen, payload)) = mqtt::image_command(&publish, serial) {
+                    set_image(device, kind, serial, mqtt_client, screen, payload).await?;
+                }
+            }
+            Ok(MqttEvent::Connected) => {
+                // A reconnected session has none of our subscriptions, and a broker that was
+                // restarted without persistence has none of our discovery configs either
+                mqtt::publish_discovery(mqtt_client, serial, kind).await;
+                mqtt::subscribe_images(mqtt_client, serial).await;
+            }
+            // Images are big, so only a few are kept waiting. Dropping the ones this device
+            // couldn't keep up with is better than holding on to megabytes of stale pictures.
+            Err(RecvError::Lagged(n)) => {
+                println!("[{serial}] Dropped {n} MQTT message(s) that arrived too fast to draw");
+            }
+            // The event loop is only gone once the whole app is shutting down. The device stays
+            // usable as an input until it is told to stop, so don't end the session over it.
+            Err(RecvError::Closed) => return std::future::pending().await,
+        }
     }
 }
 
@@ -234,68 +292,137 @@ async fn connect(dev: &HidDeviceInfo, kind: Kind) -> Result<Device, MirajazzErro
     unreachable!("the loop above returns on the last attempt");
 }
 
-/// Writes the images from the config to the buttons and LCD segments the device actually has
+/// Writes the images from the config to the screens the device actually has, and reports what
+/// every one of them is showing, so Home Assistant starts out in step with the device.
+///
+/// The changes only reach the screens once they are flushed.
 async fn set_images(
     device: &Device,
     kind: Kind,
     serial: &str,
     config: &DeviceConfig,
+    mqtt_client: &AsyncClient,
 ) -> Result<(), MirajazzError> {
-    for button in &config.buttons {
-        if button.id as usize >= kind.screen_key_count() {
-            println!(
-                "[{serial}] Ignoring icon for button {}: {} {} only has screens on {} buttons",
-                button.id,
-                kind.manufacturer(),
-                kind.model(),
-                kind.screen_key_count()
-            );
+    let configured = configured_icons(kind, serial, config);
 
-            continue;
-        }
-
-        let Some(icon) = load_icon(&button.icon, serial) else {
+    for screen in kind.screens() {
+        // `screens` only lists what this model has, so all of them resolve
+        let Some((hw_key, format)) = kind.resolve_screen(screen) else {
             continue;
         };
 
-        device
-            .set_button_image(button.id, kind.image_format(), icon)
-            .await?;
-    }
+        let state = match configured.get(&screen) {
+            // Every screen was blanked just before this, so one with no icon is already right
+            None => String::new(),
+            Some(name) => match icons::from_file(name) {
+                Ok(image) => {
+                    device.set_button_image(hw_key, format, image).await?;
 
-    for segment in &config.lcd {
-        let Some(hw_key) = kind.lcd_hw_key(segment.id) else {
-            println!(
-                "[{serial}] Ignoring icon for LCD segment {}: {} {} has {} LCD segments",
-                segment.id,
-                kind.manufacturer(),
-                kind.model(),
-                kind.lcd_segment_count()
-            );
+                    (*name).to_string()
+                }
+                // An icon that can't be read leaves one screen blank rather than taking the
+                // whole device down
+                Err(e) => {
+                    println!("[{serial}] Leaving {screen} blank: {e}");
 
-            continue;
+                    String::new()
+                }
+            },
         };
 
-        let Some(icon) = load_icon(&segment.icon, serial) else {
-            continue;
-        };
-
-        device
-            .set_button_image(hw_key, kind.lcd_image_format(), icon)
-            .await?;
+        mqtt::publish_image_state(mqtt_client, serial, screen, &state).await;
     }
 
     Ok(())
 }
 
-/// An icon that can't be read leaves one button blank rather than taking the whole device down
-fn load_icon(icon: &str, serial: &str) -> Option<DynamicImage> {
-    match open(format!("images/{icon}")) {
-        Ok(image) => Some(image),
-        Err(e) => {
-            println!("[{serial}] Failed to open image {icon}: {e}");
+/// Indexes the config's icons by the screen they belong to. The same config file is meant to
+/// work with either model, so an entry for a screen this device doesn't have is reported and
+/// left out rather than treated as an error.
+fn configured_icons<'a>(
+    kind: Kind,
+    serial: &str,
+    config: &'a DeviceConfig,
+) -> HashMap<Screen, &'a str> {
+    let buttons = config
+        .buttons
+        .iter()
+        .map(|button| (Screen::Button(button.id), button.icon.as_str()));
+    let lcd = config
+        .lcd
+        .iter()
+        .map(|segment| (Screen::Lcd(segment.id), segment.icon.as_str()));
 
-            None
+    let mut icons = HashMap::new();
+
+    for (screen, name) in buttons.chain(lcd) {
+        if kind.resolve_screen(screen).is_none() {
+            report_missing_screen(serial, kind, screen);
+
+            continue;
         }
+
+        icons.insert(screen, name);
     }
+
+    icons
+}
+
+/// Draws one image sent by Home Assistant, and reports back what the screen is showing now.
+/// A command that doesn't make sense is reported and leaves the screen as it was, rather than
+/// ending the session.
+async fn set_image(
+    device: &Device,
+    kind: Kind,
+    serial: &str,
+    mqtt_client: &AsyncClient,
+    screen: Screen,
+    payload: &[u8],
+) -> Result<(), MirajazzError> {
+    let Some((hw_key, format)) = kind.resolve_screen(screen) else {
+        report_missing_screen(serial, kind, screen);
+
+        return Ok(());
+    };
+
+    // Decoding a picture someone else chose the size of is the one slow, purely CPU-bound step
+    // in here, so get it off the async worker, the same way mirajazz does when it converts an
+    // image for the device
+    let icon = tokio::task::block_in_place(|| icons::from_payload(payload));
+
+    let state = match icon {
+        Ok(Icon::Show { image, state }) => {
+            device.set_button_image(hw_key, format, image).await?;
+
+            state
+        }
+        Ok(Icon::Clear) => {
+            device.clear_button_image(hw_key).await?;
+
+            String::new()
+        }
+        // Home Assistant handing our own marker back, which says nothing about what to show
+        Ok(Icon::Unchanged) => return Ok(()),
+        Err(e) => {
+            println!("[{serial}] Ignoring image for {screen}: {e}");
+
+            return Ok(());
+        }
+    };
+
+    device.flush().await?;
+
+    mqtt::publish_image_state(mqtt_client, serial, screen, &state).await;
+
+    Ok(())
+}
+
+fn report_missing_screen(serial: &str, kind: Kind, screen: Screen) {
+    println!(
+        "[{serial}] Ignoring image for {screen}: the {} {} has {} button screens and {} LCD segments",
+        kind.manufacturer(),
+        kind.model(),
+        kind.screen_key_count(),
+        kind.lcd_segment_count()
+    );
 }

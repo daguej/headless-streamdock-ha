@@ -7,17 +7,19 @@ use rumqttc::AsyncClient;
 use std::{collections::HashMap, error::Error, time::Duration};
 use tokio::{
     signal::unix::{SignalKind, signal},
-    sync::watch,
+    sync::{broadcast, watch},
     task::{AbortHandle, JoinSet},
 };
 
 use crate::{
     config::Config,
     mappings::{Kind, QUERIES},
+    mqtt::MqttEvent,
 };
 
 mod config;
 mod device;
+mod icons;
 mod inputs;
 mod mappings;
 mod mqtt;
@@ -34,19 +36,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let config = config::load_config().expect("Failed to load config");
 
-    let (mqtt_client, mut mqtt_eventloop) = mqtt::init_client("headless-streamdock");
-    // rumqttc requires the eventloop to be polled continuously to drive the connection.
-    let mqtt_poll_handle = tokio::spawn(async move {
-        loop {
-            if let Err(e) = mqtt_eventloop.poll().await {
-                println!("MQTT connection error: {e}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    });
+    let (mqtt_client, mqtt_eventloop) = mqtt::init_client("headless-streamdock");
+    let (mqtt_events, mqtt_poll_handle) = mqtt::spawn_event_loop(mqtt_eventloop);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut devices = Devices::new(config, mqtt_client.clone(), shutdown_rx);
+    let mut devices = Devices::new(config, mqtt_client.clone(), mqtt_events, shutdown_rx);
 
     // Start watching before enumerating, so a device plugged in while we are starting up is
     // picked up by one or the other. Attaching is idempotent, so showing up in both is fine.
@@ -127,6 +121,8 @@ where
 struct Devices {
     config: Config,
     mqtt_client: AsyncClient,
+    /// Incoming MQTT, which every device listens to for the messages addressed to it
+    mqtt_events: broadcast::Sender<MqttEvent>,
     shutdown: watch::Receiver<bool>,
     /// Serial number of every device we are currently running, and the handle to stop it
     running: HashMap<String, AbortHandle>,
@@ -134,10 +130,16 @@ struct Devices {
 }
 
 impl Devices {
-    fn new(config: Config, mqtt_client: AsyncClient, shutdown: watch::Receiver<bool>) -> Self {
+    fn new(
+        config: Config,
+        mqtt_client: AsyncClient,
+        mqtt_events: broadcast::Sender<MqttEvent>,
+        shutdown: watch::Receiver<bool>,
+    ) -> Self {
         Self {
             config,
             mqtt_client,
+            mqtt_events,
             shutdown,
             running: HashMap::new(),
             tasks: JoinSet::new(),
@@ -189,6 +191,7 @@ impl Devices {
             serial.clone(),
             self.config.for_device(&serial),
             self.mqtt_client.clone(),
+            self.mqtt_events.subscribe(),
             self.shutdown.clone(),
         ));
 
