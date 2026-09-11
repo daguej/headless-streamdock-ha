@@ -86,7 +86,7 @@ Anything a `[[devices]]` section leaves out falls back to the top level, so a de
 
 ## Controlling the screens from Home Assistant
 
-Every screen the connected device has gets a text entity named after it ("Button 0 image", "LCD segment 0 image"), listed under Configuration on the device page alongside the [screen timeout switch](#keeping-the-screens-lit). Typing the name of a file from `images/` into one sets that screen, and emptying the field blanks it, so the screens can be changed from a dashboard without touching the config file.
+Every screen the connected device has gets a text entity named after it ("Button 0 image", "LCD segment 0 image"), listed under Configuration on the device page alongside the [screen timeout switch](#keeping-the-screens-lit) and the [brightness slider](#adjusting-the-brightness). Typing the name of a file from `images/` into one sets that screen, and emptying the field blanks it, so the screens can be changed from a dashboard without touching the config file.
 
 The entity's value is also what the screen is showing right now, and it is published retained, so it stays right across a Home Assistant restart.
 
@@ -176,6 +176,36 @@ actions:
 
 `ON` and `OFF` are what Home Assistant sends, and `true`/`false` and `1`/`0` are accepted too, in any case. Publish with `retain: true` (which the switch does for you) and the setting survives a restart of either side, exactly as the images do; without it the screens dim again as soon as the device next reconnects. A payload that is neither on nor off is logged and ignored, leaving the setting as it was.
 
+## Adjusting the brightness
+
+`brightness` in `config.toml` is what a device's screens are lit at when it connects. To change it without editing the file — a dock that should be dimmer in the evening, or brighter in a sunlit room — each device also gets a "Screen brightness" slider, listed under Configuration on the device page next to the screen timeout switch.
+
+Moving it lights the screens at the new level straight away, in percent from 0 to 100. Screens that have already dimmed are the exception: they stay dim, and come back at the new level on the next button press, so adjusting a slider doesn't light up a device nobody is using. The level is remembered across dimming, so a dock keeps the brightness it was set to rather than reverting to the configured one.
+
+### Setting it from an automation
+
+The slider is backed by one MQTT topic per device, like the screens and the timeout:
+
+| Topic | What it does |
+| --- | --- |
+| `streamdock/<serial>/brightness/set` | Lights the screens at this percentage, 0-100 |
+| `streamdock/<serial>/brightness` | Reports the percentage they are lit at now (published by the app, don't write to it) |
+
+```yaml
+triggers:
+  - trigger: state
+    entity_id: sun.sun
+    to: below_horizon
+actions:
+  - action: mqtt.publish
+    data:
+      topic: streamdock/AL12345678/brightness/set
+      retain: true
+      payload: "15"
+```
+
+Whole numbers are what Home Assistant's slider sends, and a decimal such as `39.6` is accepted too and rounded. Publish with `retain: true` (which the slider does for you) and the brightness survives a restart of either side; without it the screens go back to the `config.toml` level as soon as the device next reconnects. A payload that isn't a number, or one outside 0-100, is logged and ignored rather than clamped, so a value in the wrong units doesn't quietly darken the device.
+
 ## Setting up automations in Home Assistant
 
 Once the app is running and connected to your MQTT broker, it publishes discovery data and a new device named "Stream Dock (...)" appears under Settings -> Devices & Services -> MQTT. From there you can build one "Device" automation per button/knob trigger (Settings -> Automations -> Add Automation -> When -> Device -> select the Stream Dock device -> pick a trigger such as "Button 1 pressed" or "Knob 0 rotated left/right").
@@ -208,4 +238,4 @@ Which means `vendor_id = 0x6603` and `product_id = 0x1003`. If the device is rec
 - Set custom pictures for buttons with screens, and for the LCD strip on devices that have one
 - Change any screen from Home Assistant while running, either by naming a file or by sending the image itself over MQTT
 - Configure timeout for screens, and turn it off from Home Assistant while running to keep a device lit
-- Configure screen brightness
+- Configure screen brightness, and adjust it from Home Assistant while running

@@ -29,6 +29,12 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// Identifies the screen timeout entity within its device
 const TIMEOUT_OBJECT_ID: &str = "screen_timeout";
 
+/// Identifies the screen brightness entity within its device
+const BRIGHTNESS_OBJECT_ID: &str = "brightness";
+
+/// The device takes its brightness as a percentage, so this is the top of the range
+const MAX_BRIGHTNESS: u8 = 100;
+
 /// What Home Assistant's switch sends and expects by default, and what this app reports
 const PAYLOAD_ON: &str = "ON";
 const PAYLOAD_OFF: &str = "OFF";
@@ -41,6 +47,8 @@ pub enum Command<'a> {
     /// Let the screens dim after the configured idle period, or keep them lit however long the
     /// device sits untouched
     Timeout(bool),
+    /// Light the screens at this percentage of full brightness
+    Brightness(u8),
 }
 
 /// Something that happened on the MQTT connection and that the devices need to know about
@@ -141,6 +149,16 @@ fn timeout_command_topic(device_id: &str) -> String {
     format!("{}/set", timeout_topic(device_id))
 }
 
+/// Where the brightness the screens are lit at is reported
+fn brightness_topic(device_id: &str) -> String {
+    format!("{TOPIC_ROOT}/{device_id}/brightness")
+}
+
+/// Where a new screen brightness is sent
+fn brightness_command_topic(device_id: &str) -> String {
+    format!("{}/set", brightness_topic(device_id))
+}
+
 /// Identifies a screen's entity within its device
 fn image_object_id(screen: Screen) -> String {
     match screen {
@@ -151,8 +169,8 @@ fn image_object_id(screen: Screen) -> String {
 
 // Publishes retained HA MQTT discovery configs for one device: a device-automation trigger per
 // button and three (rotate_left/rotate_right/press) per knob, a text entity per screen to set the
-// image it shows, and a switch for the screen timeout. How many of each there are depends on the
-// model of the device.
+// image it shows, a switch for the screen timeout and a number for the screen brightness. How many
+// of each there are depends on the model of the device.
 pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind) {
     let prefix = discovery_prefix();
     let topic = trigger_topic(device_id);
@@ -256,6 +274,34 @@ pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind
         &payload,
     )
     .await;
+
+    // Retained as well, so the screens come back at the brightness they were last set to rather
+    // than at the one in `config.toml`
+    let payload = json!({
+        "name": "Screen brightness",
+        "unique_id": format!("{TOPIC_ROOT}_{device_id}_{BRIGHTNESS_OBJECT_ID}"),
+        "command_topic": brightness_command_topic(device_id),
+        "state_topic": brightness_topic(device_id),
+        "min": 0,
+        "max": MAX_BRIGHTNESS,
+        "step": 1,
+        "mode": "slider",
+        "unit_of_measurement": "%",
+        "retain": true,
+        "entity_category": "config",
+        "icon": "mdi:brightness-6",
+        "device": device,
+    });
+
+    publish_discovery_config(
+        client,
+        &prefix,
+        "number",
+        device_id,
+        BRIGHTNESS_OBJECT_ID,
+        &payload,
+    )
+    .await;
 }
 
 async fn publish_discovery_config(
@@ -273,17 +319,18 @@ async fn publish_discovery_config(
         .unwrap_or_else(|_| println!("Failed to publish discovery config for {object_id}"));
 }
 
-/// Asks for the commands addressed to one device: the images for its screens and the state of its
-/// screen timeout.
+/// Asks for the commands addressed to one device: the images for its screens, the state of its
+/// screen timeout and the brightness its screens are lit at.
 ///
 /// This has to be repeated on every new connection, because an MQTT session starts with no
 /// subscriptions. The broker replays the retained commands each time, which is what restores the
-/// screens and the timeout setting after this app restarts or the connection drops.
+/// screens and the two settings after this app restarts or the connection drops.
 pub async fn subscribe_commands(client: &AsyncClient, device_id: &str) {
     // One filter covers every screen: the image commands only differ in the button/lcd path
     let filters = [
         format!("{TOPIC_ROOT}/{device_id}/+/+/image/set"),
         timeout_command_topic(device_id),
+        brightness_command_topic(device_id),
     ];
 
     for filter in filters {
@@ -306,6 +353,10 @@ fn parse_command<'a>(topic: &str, payload: &'a [u8], device_id: &str) -> Option<
 
     if topic == timeout_command_topic(device_id) {
         return parse_timeout(payload, device_id).map(Command::Timeout);
+    }
+
+    if topic == brightness_command_topic(device_id) {
+        return parse_brightness(payload, device_id).map(Command::Brightness);
     }
 
     None
@@ -337,6 +388,43 @@ fn parse_timeout(payload: &[u8], device_id: &str) -> Option<bool> {
             None
         }
     }
+}
+
+/// Reads a brightness percentage. Home Assistant's number entity sends whole numbers, but a
+/// template can just as easily produce `40.0`, so both are read. An empty payload is a retained
+/// command being cleared rather than a setting, so it says nothing about how bright to be, and a
+/// level the screens can't be lit at is reported rather than quietly clamped, so a payload in the
+/// wrong units doesn't silently darken the device.
+fn parse_brightness(payload: &[u8], device_id: &str) -> Option<u8> {
+    let Ok(text) = str::from_utf8(payload) else {
+        println!("[{device_id}] Ignoring a screen brightness command that isn't text");
+
+        return None;
+    };
+
+    let command = text.trim();
+
+    if command.is_empty() {
+        return None;
+    }
+
+    let percent = command
+        .parse::<f64>()
+        .ok()
+        .map(f64::round)
+        .filter(|percent| (0.0..=f64::from(MAX_BRIGHTNESS)).contains(percent));
+
+    let Some(percent) = percent else {
+        println!(
+            "[{device_id}] Ignoring screen brightness command '{}', expected a number from 0 to \
+             {MAX_BRIGHTNESS}",
+            Shortened(command)
+        );
+
+        return None;
+    };
+
+    Some(percent as u8)
 }
 
 fn parse_image_command(topic: &str, device_id: &str) -> Option<Screen> {
@@ -389,6 +477,23 @@ pub async fn publish_timeout_state(client: &AsyncClient, device_id: &str, enable
         .publish(timeout_topic(device_id), QoS::AtLeastOnce, true, payload)
         .await
         .unwrap_or_else(|_| println!("[{device_id}] Failed to publish the screen timeout state"));
+}
+
+/// Reports how bright the screens are lit, so the Home Assistant number matches the device.
+/// Retained, like the image and timeout states, so it is still right for a Home Assistant that
+/// restarts while this app keeps running.
+pub async fn publish_brightness_state(client: &AsyncClient, device_id: &str, percent: u8) {
+    client
+        .publish(
+            brightness_topic(device_id),
+            QoS::AtLeastOnce,
+            true,
+            percent.to_string(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            println!("[{device_id}] Failed to publish the screen brightness state")
+        });
 }
 
 pub async fn handle_button(client: &AsyncClient, device_id: &str, i: u8) {
@@ -505,6 +610,71 @@ mod tests {
     }
 
     #[test]
+    fn the_brightness_command_is_not_mistaken_for_an_image_or_the_timeout() {
+        let topic = brightness_command_topic(SERIAL);
+
+        assert_eq!(parse_image_command(&topic, SERIAL), None);
+        assert_eq!(
+            parse_command(&topic, b"60", SERIAL),
+            Some(Command::Brightness(60))
+        );
+
+        // And the timeout topic, which sits at the same depth, is still the timeout's
+        assert_eq!(
+            parse_command(&timeout_command_topic(SERIAL), b"OFF", SERIAL),
+            Some(Command::Timeout(false))
+        );
+    }
+
+    #[test]
+    fn the_brightness_takes_the_spellings_home_assistant_and_a_shell_send() {
+        // Home Assistant's number entity sends whole numbers, a template can produce a decimal,
+        // and a shell send may bring a trailing newline along
+        for (payload, expected) in [
+            ("0", 0),
+            ("40", 40),
+            ("100", 100),
+            ("40.0", 40),
+            ("39.6", 40),
+            (" 40\n", 40),
+        ] {
+            assert_eq!(
+                parse_brightness(payload.as_bytes(), SERIAL),
+                Some(expected),
+                "'{payload}' should have set the brightness to {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_brightness_payload_that_says_nothing_leaves_the_setting_alone() {
+        for payload in [
+            // A retained command being cleared, which is not a request to go dark
+            &b""[..],
+            &b"  "[..],
+            // Outside the range the screens can be lit at, rather than clamped to it
+            &b"101"[..],
+            &b"-1"[..],
+            &b"inf"[..],
+            &b"NaN"[..],
+            // Not a number at all
+            &b"bright"[..],
+            &b"40%"[..],
+            // Not text at all, such as an image sent to the wrong topic
+            &[0xff, 0xfe][..],
+        ] {
+            assert_eq!(parse_brightness(payload, SERIAL), None);
+        }
+    }
+
+    #[test]
+    fn a_brightness_command_for_another_device_is_not_ours() {
+        let topic = brightness_command_topic("CL87654321");
+
+        assert_eq!(parse_command(&topic, b"60", SERIAL), None);
+    }
+
+    #[test]
     fn the_state_topic_is_not_the_command_topic() {
         // Otherwise reporting a screen's state would immediately look like a new command
         let screen = Screen::Button(0);
@@ -518,10 +688,16 @@ mod tests {
             None
         );
 
-        // And the same for the timeout, where reporting the state back as a command would be a
+        // And the same for the settings, where reporting the state back as a command would be a
         // loop rather than just a wrong screen
         assert_ne!(timeout_topic(SERIAL), timeout_command_topic(SERIAL));
         assert_eq!(parse_command(&timeout_topic(SERIAL), b"OFF", SERIAL), None);
+
+        assert_ne!(brightness_topic(SERIAL), brightness_command_topic(SERIAL));
+        assert_eq!(
+            parse_command(&brightness_topic(SERIAL), b"60", SERIAL),
+            None
+        );
     }
 
     #[test]
