@@ -6,7 +6,7 @@ use mirajazz::{
 };
 use rumqttc::AsyncClient;
 use std::{collections::HashMap, time::Duration};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::{
     config::DeviceConfig,
@@ -15,8 +15,24 @@ use crate::{
     mqtt::{self, Command, MqttEvent},
 };
 
-/// Drives a single device from connect to disconnect. Anything that goes wrong with one device
-/// is reported and ends only its own session, so the other connected devices keep running.
+/// How long to wait before reconnecting a device whose session ended on its own
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+/// How far that wait is allowed to grow while a device keeps failing as soon as it connects, so a
+/// device we can't get anything out of is retried occasionally instead of spun on
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+
+/// A session that lasted this long was a working device that hit a one-off rather than one that
+/// never got going, so it starts the wait above over again
+const HEALTHY_SESSION: Duration = Duration::from_secs(60);
+
+/// Drives a single device for as long as it stays plugged in. Anything that goes wrong with one
+/// device is reported and ends only its own session, so the other connected devices keep running.
+///
+/// A session that ends on its own is reconnected rather than left for dead: the device is still
+/// plugged in, so the watcher has no event to report for it, and nothing else would ever bring it
+/// back. Unplugging is what ends this for good, either because the watcher aborts us or because
+/// the device stops being found below.
 ///
 /// The serial number doubles as the device's identity everywhere: it keys the config, names the
 /// MQTT topics, and prefixes this device's log lines.
@@ -27,7 +43,7 @@ pub async fn run(
     config: DeviceConfig,
     mqtt_client: AsyncClient,
     mut mqtt_events: broadcast::Receiver<MqttEvent>,
-    shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     println!(
         "[{serial}] Connecting to {} {} ({:04X}:{:04X})",
@@ -37,12 +53,82 @@ pub async fn run(
         info.product_id
     );
 
-    let device = match connect(&info, kind).await {
+    let mut delay = RECONNECT_DELAY;
+
+    loop {
+        let outcome = attempt(
+            &info,
+            kind,
+            &serial,
+            &config,
+            &mqtt_client,
+            &mut mqtt_events,
+            &mut shutdown,
+        )
+        .await;
+
+        let Attempt::Failed { was_working } = outcome else {
+            break;
+        };
+
+        // A device that had been working and hit a one-off is worth coming straight back to; one
+        // that fails as soon as we connect to it is backed off rather than spun on
+        if was_working {
+            delay = RECONNECT_DELAY;
+        }
+
+        // Don't announce a reconnect we aren't going to make
+        if *shutdown.borrow() {
+            break;
+        }
+
+        println!("[{serial}] Reconnecting in {}s", delay.as_secs());
+
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            // No point sitting out the wait when we're shutting down anyway
+            _ = cancelled(&mut shutdown) => break,
+        }
+
+        delay = (delay * 2).min(MAX_RECONNECT_DELAY);
+    }
+
+    println!("[{serial}] Stopped");
+}
+
+/// What one go at running a device came to, and so whether it is worth another
+enum Attempt {
+    /// The device is gone, or we were asked to stop: there is nothing left to do for it
+    Finished,
+    /// It failed, but the device is still plugged in, so it can be reconnected. Says whether it
+    /// had been working for a while first, which decides how long we wait before doing that.
+    Failed { was_working: bool },
+}
+
+/// Connects to a device and runs it until the session ends, one way or another
+async fn attempt(
+    info: &HidDeviceInfo,
+    kind: Kind,
+    serial: &str,
+    config: &DeviceConfig,
+    mqtt_client: &AsyncClient,
+    mqtt_events: &mut broadcast::Receiver<MqttEvent>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Attempt {
+    let device = match connect(info, kind).await {
         Ok(device) => device,
+        // The backend no longer finding the device at all is how an unplug reaches us when the
+        // watcher isn't around to report it. Anything else is a device that is still plugged in,
+        // and a device that is there is always worth another try.
+        Err(MirajazzError::DeviceNotFoundError) => {
+            println!("[{serial}] Unplugged");
+
+            return Attempt::Finished;
+        }
         Err(e) => {
             println!("[{serial}] Failed to connect: {e}");
 
-            return;
+            return Attempt::Failed { was_working: false };
         }
     };
 
@@ -53,27 +139,38 @@ pub async fn run(
         kind.encoder_count()
     );
 
-    mqtt::publish_discovery(&mqtt_client, &serial, kind).await;
+    mqtt::publish_discovery(mqtt_client, serial, kind).await;
 
-    let session = session(
+    let started = tokio::time::Instant::now();
+    let result = session(
         &device,
         kind,
-        &serial,
-        &config,
-        &mqtt_client,
-        &mut mqtt_events,
+        serial,
+        config,
+        mqtt_client,
+        mqtt_events,
         shutdown,
-    );
-
-    if let Err(e) = session.await {
-        println!("[{serial}] Session ended: {e}");
-    }
+    )
+    .await;
 
     // Best effort: when the device was unplugged it is already gone and these just fail
     let _ = device.flush().await;
     let _ = device.shutdown().await;
 
-    println!("[{serial}] Stopped");
+    // Let go of the device before the caller waits to reconnect: opening it afresh is the whole
+    // point of trying again, and there is nothing left here to keep it open for
+    drop(device);
+
+    // Being asked to stop is the only way a session ends without something having gone wrong
+    let Err(e) = result else {
+        return Attempt::Finished;
+    };
+
+    println!("[{serial}] Session ended: {e}");
+
+    Attempt::Failed {
+        was_working: started.elapsed() >= HEALTHY_SESSION,
+    }
 }
 
 /// Sets the device up and then reads from it until it goes away or we're asked to shut down.
@@ -85,8 +182,11 @@ async fn session(
     config: &DeviceConfig,
     mqtt_client: &AsyncClient,
     mqtt_events: &mut broadcast::Receiver<MqttEvent>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), MirajazzError> {
+    // Nothing else is talking to the device until the loops below start, so the setup here has it
+    // to itself and needs no lock
+
     // Some devices ignore every other command until they are put into the right mode
     if let Some(mode) = kind.startup_mode() {
         device.set_mode(mode).await?;
@@ -114,8 +214,20 @@ async fn session(
 
     let reader = device.get_reader(kind.process_input());
 
+    // mirajazz hands out the device's writer one report at a time, so an operation that takes
+    // several of them lets go of it in between: an image is a header saying how many bytes
+    // follow, then those bytes in 1KB reports. All three loops below write to this device, and a
+    // report from one of them landing inside another's transfer leaves the device waiting on
+    // bytes that never come, out of step with us until it stops acknowledging writes at all —
+    // which surfaces as a write timing out. Holding this for a whole operation is what keeps them
+    // out of each other's transfers.
+    //
+    // Reading is deliberately not covered by it: input comes from the device's other half, and
+    // waiting for a keypress under this lock would stop everything else from writing.
+    let device = Mutex::new(device);
+
     let input = input_loop(
-        device,
+        &device,
         &reader,
         serial,
         config,
@@ -124,7 +236,7 @@ async fn session(
         &mut brightness_changes,
     );
     let commands = command_loop(
-        device,
+        &device,
         kind,
         serial,
         mqtt_client,
@@ -136,15 +248,15 @@ async fn session(
     tokio::select! {
         result = input => result,
         result = commands => result,
-        result = keepalive_loop(device, kind) => result,
-        _ = cancelled(&mut shutdown) => Ok(()),
+        result = keepalive_loop(&device, kind) => result,
+        _ = cancelled(shutdown) => Ok(()),
     }
 }
 
 /// Carries out what Home Assistant asks of the device for as long as it is connected: the images
 /// to put on the screens it addresses, whether those screens may dim, and how brightly they are lit
 async fn command_loop(
-    device: &Device,
+    device: &Mutex<&Device>,
     kind: Kind,
     serial: &str,
     mqtt_client: &AsyncClient,
@@ -201,7 +313,7 @@ async fn command_loop(
 /// untouched, and switching it off wakes screens that have already dimmed. This loop also owns how
 /// bright the screens are lit, because it is the one that dims and wakes them.
 async fn input_loop(
-    device: &Device,
+    device: &Mutex<&Device>,
     reader: &DeviceStateReader,
     serial: &str,
     config: &DeviceConfig,
@@ -252,7 +364,9 @@ async fn input_loop(
 
                 // Screens that have dimmed stay dim: the new level is what they come back to on
                 // the next input, rather than a slider lighting up a device nobody has touched
-                if !is_dimmed && let Err(e) = device.set_brightness(brightness).await {
+                if !is_dimmed
+                    && let Err(e) = device.lock().await.set_brightness(brightness).await
+                {
                     println!("[{serial}] Failed to set brightness: {e}");
                 }
 
@@ -270,7 +384,7 @@ async fn input_loop(
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 if !is_dimmed {
-                    match device.sleep().await {
+                    match device.lock().await.sleep().await {
                         Ok(()) => is_dimmed = true,
                         Err(e) => println!("[{serial}] Failed to dim brightness: {e}"),
                     }
@@ -312,8 +426,8 @@ async fn input_loop(
 
 /// Brings the screens back up after they dimmed, and says whether they are lit now, so a device
 /// that wouldn't come back is tried again on the next input rather than left dim for good
-async fn wake(device: &Device, serial: &str, brightness: u8) -> bool {
-    match device.set_brightness(brightness).await {
+async fn wake(device: &Mutex<&Device>, serial: &str, brightness: u8) -> bool {
+    match device.lock().await.set_brightness(brightness).await {
         Ok(()) => true,
         Err(e) => {
             println!("[{serial}] Failed to restore brightness: {e}");
@@ -390,7 +504,7 @@ async fn set_brightness(
 
 /// Pings devices that drop the connection when idle. Never returns for devices that don't
 /// need it, so it can always be selected over.
-async fn keepalive_loop(device: &Device, kind: Kind) -> Result<(), MirajazzError> {
+async fn keepalive_loop(device: &Mutex<&Device>, kind: Kind) -> Result<(), MirajazzError> {
     let Some(interval) = kind.keepalive_interval() else {
         return std::future::pending().await;
     };
@@ -398,7 +512,7 @@ async fn keepalive_loop(device: &Device, kind: Kind) -> Result<(), MirajazzError
     loop {
         tokio::time::sleep(interval).await;
 
-        device.keep_alive().await?;
+        device.lock().await.keep_alive().await?;
     }
 }
 
@@ -528,7 +642,7 @@ fn configured_icons<'a>(
 /// A command that doesn't make sense is reported and leaves the screen as it was, rather than
 /// ending the session.
 async fn set_image(
-    device: &Device,
+    device: &Mutex<&Device>,
     kind: Kind,
     serial: &str,
     mqtt_client: &AsyncClient,
@@ -543,8 +657,13 @@ async fn set_image(
 
     // Decoding a picture someone else chose the size of is the one slow, purely CPU-bound step
     // in here, so get it off the async worker, the same way mirajazz does when it converts an
-    // image for the device
+    // image for the device. Decoded before taking the device below, so the other loops aren't
+    // held up by it.
     let icon = tokio::task::block_in_place(|| icons::from_payload(payload));
+
+    // Held across both steps: the flush is where the image is actually transferred, and it is
+    // that transfer the other loops must not write into
+    let device = device.lock().await;
 
     let state = match icon {
         Ok(Icon::Show { image, state }) => {
@@ -567,6 +686,8 @@ async fn set_image(
     };
 
     device.flush().await?;
+
+    drop(device);
 
     mqtt::publish_image_state(mqtt_client, serial, screen, &state).await;
 

@@ -74,8 +74,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 DeviceLifecycleEvent::Connected(info) => devices.attach(info),
                 DeviceLifecycleEvent::Disconnected(info) => devices.detach(&info),
             },
-            // A device that stopped on its own (an error, or an unplug the watcher hasn't
-            // reported yet) has to be forgotten so it can be attached again later
+            // A device task reconnects its own device, so one that stopped on its own has given
+            // up on it (an unplug the watcher hasn't reported yet) and has to be forgotten, so
+            // the device can be attached again if it comes back
             Some(_) = devices.join_next() => devices.reap(),
             _ = sigint.recv() => {
                 println!("Received SIGINT");
