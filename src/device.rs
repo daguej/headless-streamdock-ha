@@ -5,7 +5,7 @@ use mirajazz::{
     types::HidDeviceInfo,
 };
 use rumqttc::AsyncClient;
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, future::Future, time::Duration};
 use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::{
@@ -29,11 +29,36 @@ const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 /// How long to let a device act on a mode change before saying anything else to it
 const MODE_SETTLE: Duration = Duration::from_millis(50);
 
-/// Putting one image on a screen is a few kilobytes, which is nothing; taking longer than this
-/// means the device is dragging its heels over accepting the data rather than us being slow to
+/// Everything we ask a device to do is a few kilobytes at most, which is nothing; taking longer
+/// than this means it is dragging its heels over accepting the data rather than us being slow to
 /// send it. Worth saying out loud, because the kernel gives up on a report that takes more than
 /// five seconds and that ends the session.
-const SLOW_TRANSFER: Duration = Duration::from_millis(500);
+const SLOW_OPERATION: Duration = Duration::from_millis(500);
+
+/// Carries out one thing we ask of a device, reporting it when it fails or drags.
+///
+/// Every write here is a blocking transfer the kernel abandons after five seconds, and when that
+/// happens the only thing distinguishing the commands is which one we were in the middle of. So
+/// each is named, and the time it took is reported either way: a command that fails says how long
+/// it hung on for first, which is what separates a device refusing data from one never asked.
+async fn timed<T>(
+    serial: &str,
+    what: &str,
+    op: impl Future<Output = Result<T, MirajazzError>>,
+) -> Result<T, MirajazzError> {
+    let started = tokio::time::Instant::now();
+    let result = op.await;
+    let took = started.elapsed();
+    let seconds = took.as_secs_f32();
+
+    match &result {
+        Err(e) => println!("[{serial}] {what} failed after {seconds:.1}s: {e}"),
+        Ok(_) if took >= SLOW_OPERATION => println!("[{serial}] {what} took {seconds:.1}s"),
+        Ok(_) => {}
+    }
+
+    result
+}
 
 /// Drives a single device for as long as it stays plugged in. Anything that goes wrong with one
 /// device is reported and ends only its own session, so the other connected devices keep running.
@@ -175,7 +200,12 @@ async fn attempt(
         return Attempt::Finished;
     };
 
-    println!("[{serial}] Session ended: {e}");
+    // How long it lasted is the first thing worth knowing: a session that dies on the same command
+    // every time looks nothing like one that ran for a while and then hit something
+    println!(
+        "[{serial}] Session ended after {:.1}s: {e}",
+        started.elapsed().as_secs_f32()
+    );
 
     Attempt::Failed {
         was_working: started.elapsed() >= HEALTHY_SESSION,
@@ -213,21 +243,31 @@ async fn session(
 
     // Some devices ignore every other command until they are put into the right mode
     if let Some(mode) = kind.startup_mode() {
-        device.set_mode(mode).await?;
+        timed(serial, "Setting the mode", device.set_mode(mode)).await?;
 
         // A mode change takes the device a moment to act on, and it ignores what arrives in the
         // meantime. mirajazz's own N1 example waits the same way before saying anything else.
         tokio::time::sleep(MODE_SETTLE).await;
     }
 
-    device.set_brightness(config.brightness).await?;
-    device.clear_all_button_images().await?;
+    timed(
+        serial,
+        "Setting the startup brightness",
+        device.set_brightness(config.brightness),
+    )
+    .await?;
+    timed(
+        serial,
+        "Blanking the screens",
+        device.clear_all_button_images(),
+    )
+    .await?;
 
     // Write the configured images to the device
     set_images(device, kind, serial, config, mqtt_client).await?;
 
     // Flush
-    device.flush().await?;
+    timed(serial, "Sending the startup images", device.flush()).await?;
 
     // The screens dim on their own, and are lit at the configured brightness, until Home Assistant
     // says otherwise, which a retained command on the subscription below does as soon as it arrives
@@ -264,7 +304,7 @@ async fn session(
     tokio::select! {
         result = input => result,
         result = commands => result,
-        result = keepalive_loop(&device, kind) => result,
+        result = keepalive_loop(&device, serial, kind) => result,
         _ = cancelled(shutdown) => Ok(()),
     }
 }
@@ -398,10 +438,14 @@ async fn input_loop(
 
                 // Screens that have dimmed stay dim: the new level is what they come back to on
                 // the next input, rather than a slider lighting up a device nobody has touched
-                if !is_dimmed
-                    && let Err(e) = device.lock().await.set_brightness(brightness).await
-                {
-                    println!("[{serial}] Failed to set brightness: {e}");
+                if !is_dimmed {
+                    let device = device.lock().await;
+                    let _ = timed(
+                        serial,
+                        "Changing the brightness",
+                        device.set_brightness(brightness),
+                    )
+                    .await;
                 }
 
                 continue;
@@ -429,11 +473,13 @@ async fn input_loop(
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 if !is_dimmed {
-                    match device.lock().await.sleep().await {
-                        Ok(()) => {
-                            dimmed.send_replace(true);
-                        }
-                        Err(e) => println!("[{serial}] Failed to dim brightness: {e}"),
+                    let device = device.lock().await;
+
+                    if timed(serial, "Dimming the screens", device.sleep())
+                        .await
+                        .is_ok()
+                    {
+                        dimmed.send_replace(true);
                     }
                 }
                 continue;
@@ -477,11 +523,15 @@ async fn input_loop(
 ///
 /// Takes the device rather than the lock around it, because every caller is already holding it.
 async fn wake(device: &Device, serial: &str, dimmed: &watch::Sender<bool>, brightness: u8) {
-    match device.set_brightness(brightness).await {
-        Ok(()) => {
-            dimmed.send_replace(false);
-        }
-        Err(e) => println!("[{serial}] Failed to restore brightness: {e}"),
+    let lit = timed(
+        serial,
+        "Waking the screens",
+        device.set_brightness(brightness),
+    )
+    .await;
+
+    if lit.is_ok() {
+        dimmed.send_replace(false);
     }
 }
 
@@ -552,7 +602,11 @@ async fn set_brightness(
 
 /// Pings devices that drop the connection when idle. Never returns for devices that don't
 /// need it, so it can always be selected over.
-async fn keepalive_loop(device: &Mutex<&Device>, kind: Kind) -> Result<(), MirajazzError> {
+async fn keepalive_loop(
+    device: &Mutex<&Device>,
+    serial: &str,
+    kind: Kind,
+) -> Result<(), MirajazzError> {
     let Some(interval) = kind.keepalive_interval() else {
         return std::future::pending().await;
     };
@@ -560,7 +614,9 @@ async fn keepalive_loop(device: &Mutex<&Device>, kind: Kind) -> Result<(), Miraj
     loop {
         tokio::time::sleep(interval).await;
 
-        device.lock().await.keep_alive().await?;
+        let device = device.lock().await;
+
+        timed(serial, "The keepalive ping", device.keep_alive()).await?;
     }
 }
 
@@ -738,26 +794,36 @@ async fn set_image(
     let level = *backlight.brightness.borrow();
     wake(*device, serial, &backlight.dimmed, level).await;
 
-    let started = tokio::time::Instant::now();
-
+    // Timed apart on purpose. Converting an image is pure CPU and touches nothing, while the flush
+    // is every byte of it going down the wire, so which of the two drags says whether a slow screen
+    // is the machine we're running on or the device we're talking to.
     match image {
-        Some(image) => device.set_button_image(hw_key, format, image).await?,
-        None => device.clear_button_image(hw_key).await?,
+        Some(image) => {
+            timed(
+                serial,
+                &format!("Converting the image for {screen}"),
+                device.set_button_image(hw_key, format, image),
+            )
+            .await?
+        }
+        None => {
+            timed(
+                serial,
+                &format!("Blanking {screen}"),
+                device.clear_button_image(hw_key),
+            )
+            .await?
+        }
     }
 
-    device.flush().await?;
+    timed(
+        serial,
+        &format!("Sending {screen} to the device"),
+        device.flush(),
+    )
+    .await?;
 
     drop(device);
-
-    // A device that has stopped accepting data at any pace worth the name is about to start
-    // failing outright, so say so while the transfers are still getting through
-    let took = started.elapsed();
-    if took >= SLOW_TRANSFER {
-        println!(
-            "[{serial}] {screen} took {:.1}s to reach the device",
-            took.as_secs_f32()
-        );
-    }
 
     mqtt::publish_image_state(mqtt_client, serial, screen, &state).await;
 
