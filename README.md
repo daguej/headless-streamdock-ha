@@ -86,7 +86,7 @@ Anything a `[[devices]]` section leaves out falls back to the top level, so a de
 
 ## Controlling the screens from Home Assistant
 
-Every screen the connected device has gets a text entity named after it ("Button 0 image", "LCD segment 0 image"), listed under Configuration on the device page alongside the [screen timeout switch](#keeping-the-screens-lit) and the [brightness slider](#adjusting-the-brightness). Typing the name of a file from `images/` into one sets that screen, and emptying the field blanks it, so the screens can be changed from a dashboard without touching the config file.
+Every screen the connected device has gets a text entity named after it ("Button 0 image", "LCD segment 0 image"), listed under Configuration on the device page alongside the [screen timeout switch](#keeping-the-screens-lit) and the [brightness slider](#adjusting-the-brightness). Typing the name of a file from `images/` into one sets that screen, and emptying the field (or typing `empty`, for a card that won't submit a blank one) blanks it, so the screens can be changed from a dashboard without touching the config file.
 
 The entity's value is also what the screen is showing right now, and it is published retained, so it stays right across a Home Assistant restart.
 
@@ -105,7 +105,7 @@ The payload can be any of:
 - the name of a file in `images/`, such as `light.png`
 - base64 encoded image data, optionally as a `data:image/png;base64,...` URI and optionally wrapped across lines, which is what a Home Assistant template can produce
 - raw image bytes, which is what `mosquitto_pub -f` sends
-- nothing at all, which blanks the screen
+- nothing at all, or the word `empty`, either of which blanks the screen
 
 Whichever it is is worked out from the payload itself, so the same topic takes all of them. Any format the [image](https://crates.io/crates/image) crate reads works (PNG, JPEG, GIF, WebP, BMP and more); it is resized to the screen automatically. A message may be up to 512 KiB.
 

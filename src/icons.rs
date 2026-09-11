@@ -15,6 +15,11 @@ const ICON_DIR: &str = "images";
 /// ignored, so submitting the Home Assistant text field unchanged leaves the screen alone.
 pub const INLINE: &str = "<image>";
 
+/// Blanks a screen, exactly as an empty payload does, for anywhere sending nothing at all is
+/// awkward. Matched ignoring case, so `Empty` works too, and it takes precedence over a file of
+/// the same name in `images/`.
+const EMPTY: &str = "empty";
+
 /// A name longer than this is cut short in error messages, so a mistyped command carrying a
 /// whole image doesn't fill the log with it
 const MAX_REPORTED_NAME: usize = 64;
@@ -60,6 +65,7 @@ pub fn from_payload(payload: &[u8]) -> Result<Icon, Error> {
 
     match text.trim() {
         "" => Ok(Icon::Clear),
+        name if name.eq_ignore_ascii_case(EMPTY) => Ok(Icon::Clear),
         INLINE => Ok(Icon::Unchanged),
         name => match decode_base64(name) {
             Some(image) => Ok(inline(image)),
@@ -206,6 +212,16 @@ mod tests {
     fn an_empty_payload_blanks_the_screen() {
         for payload in ["", "   ", "\n"] {
             assert!(matches!(from_payload(payload.as_bytes()), Ok(Icon::Clear)));
+        }
+    }
+
+    #[test]
+    fn the_word_empty_blanks_the_screen_too() {
+        for payload in ["empty", "Empty", " EMPTY\n"] {
+            assert!(
+                matches!(from_payload(payload.as_bytes()), Ok(Icon::Clear)),
+                "{payload} should have blanked the screen"
+            );
         }
     }
 
