@@ -240,7 +240,7 @@ struct Backlight {
     dimmed: watch::Sender<bool>,
 }
 
-/// An image for a button screen, kept for whenever the page it is on is up
+/// An image for a screen, kept for whenever the page it is on is up
 struct Picture {
     /// Already the size of the screen, so a big picture doesn't take up more than it shows
     image: DynamicImage,
@@ -248,7 +248,7 @@ struct Picture {
     state: String,
 }
 
-/// The pages of buttons a device has, and what is on each of them.
+/// The pages of buttons and screens a device has, and what is on each of them.
 ///
 /// The command loop is the only one that changes any of it. The input loop only needs to know
 /// which page is up, to tell which button was pressed, so that alone is a watch channel it shares.
@@ -257,10 +257,10 @@ struct Pages<'a> {
     count: u16,
     /// The page the device is showing
     current: &'a watch::Sender<u16>,
-    /// What every button screen shows, on every page, by button id. A screen with no entry is
-    /// blank. Pages past `count` are kept too, so an image that arrives before the page count does
-    /// isn't lost, and a page that is taken away comes back as it was.
-    images: HashMap<u16, Picture>,
+    /// What every screen shows, on every page. A screen with no entry is blank. Pages past `count`
+    /// are kept too, so an image that arrives before the page count does isn't lost, and a page
+    /// that is taken away comes back as it was.
+    images: HashMap<Screen, Picture>,
 }
 
 /// Sets the device up and then reads from it until it goes away or we're asked to shut down.
@@ -914,22 +914,20 @@ async fn connect(dev: &HidDeviceInfo, kind: Kind) -> Result<Device, MirajazzErro
 /// Writes the images from the config to the screens the device actually has, and reports what
 /// every screen that is showing is, so Home Assistant starts out in step with the device.
 ///
-/// Button images are kept for every page, and handed back for drawing each page as it comes up;
-/// only the ones on the first page are drawn now. The changes only reach the screens once they are
-/// flushed.
+/// Images are kept for every page, and handed back for drawing each page as it comes up; only the
+/// ones on the first page are drawn now. The changes only reach the screens once they are flushed.
 async fn set_images(
     device: &Device,
     kind: Kind,
     serial: &str,
     config: &DeviceConfig,
     mqtt_client: &AsyncClient,
-) -> Result<HashMap<u16, Picture>, MirajazzError> {
-    let mut buttons = HashMap::new();
-    let mut lcd = HashMap::new();
+) -> Result<HashMap<Screen, Picture>, MirajazzError> {
+    let mut images = HashMap::new();
 
     for (screen, name) in configured_icons(kind, serial, config) {
         // `configured_icons` only keeps the screens this model has, so all of them resolve
-        let Some((hw_key, format)) = kind.resolve_screen(screen) else {
+        let Some((_, format)) = kind.resolve_screen(screen) else {
             continue;
         };
 
@@ -944,30 +942,21 @@ async fn set_images(
             }
         };
 
-        match screen {
-            Screen::Button(id) => {
-                let picture = Picture {
-                    image: fit(image, format),
-                    state: name.to_string(),
-                };
+        let picture = Picture {
+            image: fit(image, format),
+            state: name.to_string(),
+        };
 
-                buttons.insert(id, picture);
-            }
-            Screen::Lcd(_) => {
-                device.set_button_image(hw_key, format, image).await?;
-                lcd.insert(screen, name);
-            }
-        }
+        images.insert(screen, picture);
     }
 
     // Every screen was blanked just before this, so one with no icon is already right
     for screen in kind.page_screens(0) {
-        let (Screen::Button(id), Some((hw_key, format))) = (screen, kind.resolve_screen(screen))
-        else {
+        let Some((hw_key, format)) = kind.resolve_screen(screen) else {
             continue;
         };
 
-        let state = match buttons.get(&id) {
+        let state = match images.get(&screen) {
             Some(picture) => {
                 device
                     .set_button_image(hw_key, format, picture.image.clone())
@@ -981,13 +970,7 @@ async fn set_images(
         mqtt::publish_image_state(mqtt_client, serial, screen, state).await;
     }
 
-    for screen in kind.lcd_screens() {
-        let state = lcd.get(&screen).copied().unwrap_or_default();
-
-        mqtt::publish_image_state(mqtt_client, serial, screen, state).await;
-    }
-
-    Ok(buttons)
+    Ok(images)
 }
 
 /// Brings an image down to the size of the screen it is for, the same way mirajazz does before
@@ -1034,8 +1017,7 @@ fn configured_icons<'a>(
 /// A command that doesn't make sense is reported and leaves the screen as it was, rather than
 /// ending the session.
 ///
-/// An image for a button is kept for whenever its page is up, and only drawn now if it is up
-/// already. The LCD strip is the same whichever page is up, so its images are always drawn.
+/// The image is kept for whenever its page is up, and only drawn now if it is up already.
 #[allow(clippy::too_many_arguments)]
 async fn set_image(
     device: &Mutex<&Device>,
@@ -1083,24 +1065,19 @@ async fn set_image(
         }
     };
 
-    let showing = match kind.screen_page(screen) {
-        Some(page) => page == *pages.current.borrow(),
-        None => true,
-    };
+    let showing = kind.screen_page(screen) == *pages.current.borrow();
 
-    if let Screen::Button(id) = screen {
-        match &image {
-            Some(image) => {
-                let picture = Picture {
-                    image: image.clone(),
-                    state: state.clone(),
-                };
+    match &image {
+        Some(image) => {
+            let picture = Picture {
+                image: image.clone(),
+                state: state.clone(),
+            };
 
-                pages.images.insert(id, picture);
-            }
-            None => {
-                pages.images.remove(&id);
-            }
+            pages.images.insert(screen, picture);
+        }
+        None => {
+            pages.images.remove(&screen);
         }
     }
 
@@ -1190,7 +1167,7 @@ async fn set_page(
 
 /// Changes how many pages of buttons the device has, as Home Assistant asks, and reports it back.
 ///
-/// A page that is added gets its buttons' entities and triggers published, and one that is taken
+/// A page that is added gets the entities and triggers for its buttons and screens published, and one that is taken
 /// away has them taken back. What was on a page taken away is kept, so adding it again brings it
 /// back as it was. A device showing a page it no longer has moves to the last one it still does.
 #[allow(clippy::too_many_arguments)]
@@ -1225,11 +1202,10 @@ async fn set_page_count(
             mqtt::publish_page_discovery(mqtt_client, serial, kind, page).await;
 
             for screen in kind.page_screens(page) {
-                let Screen::Button(id) = screen else {
-                    continue;
-                };
-
-                let state = pages.images.get(&id).map_or("", |picture| &picture.state);
+                let state = pages
+                    .images
+                    .get(&screen)
+                    .map_or("", |picture| &picture.state);
 
                 mqtt::publish_image_state(mqtt_client, serial, screen, state).await;
             }
@@ -1264,8 +1240,8 @@ async fn set_page_count(
     Ok(())
 }
 
-/// Puts a page up on the device: every button screen is redrawn with what that page has on it, and
-/// the page is reported back
+/// Puts a page up on the device: every screen is redrawn with what that page has on it, and the
+/// page is reported back
 async fn show_page(
     device: &Mutex<&Device>,
     kind: Kind,
@@ -1310,23 +1286,22 @@ async fn show_page(
     Ok(())
 }
 
-/// Puts every button screen's image for one page on the device, blanking the screens that page has
-/// nothing for. The images only reach the screens once they are flushed.
+/// Puts every screen's image for one page on the device, blanking the screens that page has nothing
+/// for. The images only reach the screens once they are flushed.
 ///
 /// Takes the device rather than the lock around it, because the caller is already holding it.
 async fn draw_page(
     device: &Device,
     kind: Kind,
-    images: &HashMap<u16, Picture>,
+    images: &HashMap<Screen, Picture>,
     page: u16,
 ) -> Result<(), MirajazzError> {
     for screen in kind.page_screens(page) {
-        let (Screen::Button(id), Some((hw_key, format))) = (screen, kind.resolve_screen(screen))
-        else {
+        let Some((hw_key, format)) = kind.resolve_screen(screen) else {
             continue;
         };
 
-        match images.get(&id) {
+        match images.get(&screen) {
             Some(picture) => {
                 device
                     .set_button_image(hw_key, format, picture.image.clone())
@@ -1341,8 +1316,8 @@ async fn draw_page(
 
 fn report_missing_screen(serial: &str, kind: Kind, screen: Screen) {
     println!(
-        "[{serial}] Ignoring image for {screen}: the {} {} has {} button screens on each of up to \
-         {MAX_PAGES} pages, and {} LCD segments",
+        "[{serial}] Ignoring image for {screen}: the {} {} has {} button screens and {} LCD \
+         segments on each of up to {MAX_PAGES} pages",
         kind.manufacturer(),
         kind.model(),
         kind.screen_key_count(),

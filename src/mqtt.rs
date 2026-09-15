@@ -246,10 +246,9 @@ fn device_info(device_id: &str, kind: Kind) -> serde_json::Value {
 }
 
 // Publishes retained HA MQTT discovery configs for one device: three triggers
-// (rotate_left/rotate_right/press) per knob, a text entity per LCD segment to set the image it
-// shows, a switch for the screen timeout, a number for the screen brightness, and numbers for how
-// many pages of buttons there are and which one is showing. Then, for each of those pages,
-// everything `publish_page_discovery` publishes for its buttons. How many of each there are
+// (rotate_left/rotate_right/press) per knob, a switch for the screen timeout, a number for the
+// screen brightness, and numbers for how many pages there are and which one is showing. Then, for
+// each of those pages, everything `publish_page_discovery` publishes for its buttons and screens. How many of each there are
 // depends on the model of the device.
 //
 // The triggers for pressing a button several times in a row come and go with its multi-click mode,
@@ -290,10 +289,6 @@ pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind
             )
             .await;
         }
-    }
-
-    for screen in kind.lcd_screens() {
-        publish_image_discovery(client, &prefix, device_id, &device, screen).await;
     }
 
     // Retained for the same reason the images are: it is the retained command that brings the
@@ -413,9 +408,9 @@ pub async fn publish_page_number_discovery(
     .await;
 }
 
-/// Publishes the discovery configs for the buttons on one page: a device-automation trigger per
-/// button, a text entity per button screen to set the image it shows, and a switch per button for
-/// its multi-click mode
+/// Publishes the discovery configs for the buttons and screens on one page: a device-automation
+/// trigger per button, a text entity per button screen and LCD segment to set the image it shows,
+/// and a switch per button for its multi-click mode
 pub async fn publish_page_discovery(client: &AsyncClient, device_id: &str, kind: Kind, page: u16) {
     let prefix = discovery_prefix();
     let topic = trigger_topic(device_id);
@@ -468,7 +463,7 @@ pub async fn publish_page_discovery(client: &AsyncClient, device_id: &str, kind:
 }
 
 /// Takes back everything `publish_page_discovery` and `publish_multi_click_state` published for
-/// the buttons on one page, once the device no longer has that page
+/// the buttons and screens on one page, once the device no longer has that page
 pub async fn remove_page_discovery(client: &AsyncClient, device_id: &str, kind: Kind, page: u16) {
     let prefix = discovery_prefix();
 
@@ -910,12 +905,11 @@ mod tests {
 
     const SERIAL: &str = "AL12345678";
 
-    /// Every screen of the N1 on its first two pages, and its LCD strip
+    /// Every screen of the N1 on its first two pages
     fn some_screens() -> Vec<Screen> {
-        let kind = Kind::VsdInsideN1;
-        let buttons = (0..2).flat_map(|page| kind.page_screens(page));
-
-        buttons.chain(kind.lcd_screens()).collect()
+        (0..2)
+            .flat_map(|page| Kind::VsdInsideN1.page_screens(page))
+            .collect()
     }
 
     #[test]

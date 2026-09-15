@@ -53,7 +53,7 @@ id = 0 # segment of the LCD strip, left to right
 icon = "clock.png"
 ```
 
-All images referenced in the config should be placed in the `images/` directory. A button `id` can be one on a later [page](#pages-of-buttons) too, such as `id = 17` for the first button of the N1's second page; it is shown once Home Assistant gives the device that page. Entries for buttons or LCD segments the connected device doesn't have (for example `id = 8` on a device whose screens stop at button 5) are skipped with a warning, so the same config file can be used with either model. An icon that can't be read leaves that button blank, it doesn't stop the device.
+All images referenced in the config should be placed in the `images/` directory. A button or LCD segment `id` can be one on a later [page](#pages-of-buttons) too, such as `id = 17` for the first button of the N1's second page, or `id = 3` for the first LCD segment of that page; it is shown once Home Assistant gives the device that page. Entries for buttons or LCD segments the connected device doesn't have (for example `id = 8` on a device whose screens stop at button 5) are skipped with a warning, so the same config file can be used with either model. An icon that can't be read leaves that button blank, it doesn't stop the device.
 
 ### Giving one device its own settings
 
@@ -229,9 +229,11 @@ A device can have more than one page of buttons, with only one of them showing a
 
 Every page is a full set of buttons with ids of their own: the buttons of each page are numbered on from the last button of the page before. On the N1, which has 17 buttons (ids 0-16), the first page is buttons 0-16, the second is 17-33, and so on; on the N3, with 9 buttons, the second page is 9-17. So a button is always `page * button_count + button_index`, and pressing the top-left button of the N1 while its second page is up reports `button_17_press`.
 
-Everything that belongs to a button belongs to it on its page: its trigger, its image entity ("Button 17 image"), and its multi-click switch. They are added to Home Assistant when a page is added and removed again when it is taken away. The LCD strip and the knobs aren't paged, they are the same whichever page is up.
+The LCD strip is paged the same way, numbered by its own segment count: on the N1's 3-segment strip, the first page is segments 0-2, the second is 3-5, and so on, so `streamdock/<serial>/lcd/3/image/set` sets the left segment of the second page.
 
-Switching pages redraws every button screen with what that page has on it, and lights the screens if they had dimmed. Images for a page that isn't showing can be set at any time; they are kept and drawn when that page comes up, and a page that is taken away and added again comes back as it was. A press is reported as the button on the page that was up when it went down, so a button that switches pages still reports its release (and counts its presses) as the button it was pressed as.
+Everything that belongs to a button or segment belongs to it on its page: a button's trigger, image entity ("Button 17 image") and multi-click switch, and a segment's image entity ("LCD segment 3 image"). They are added to Home Assistant when a page is added and removed again when it is taken away. The knobs aren't paged, they are the same whichever page is up.
+
+Switching pages redraws every screen, buttons and LCD strip alike, with what that page has on it, and lights the screens if they had dimmed. Images for a page that isn't showing can be set at any time; they are kept and drawn when that page comes up, and a page that is taken away and added again comes back as it was. A press is reported as the button on the page that was up when it went down, so a button that switches pages still reports its release (and counts its presses) as the button it was pressed as.
 
 ### Switching pages from an automation
 
@@ -287,7 +289,7 @@ Which means `vendor_id = 0x6603` and `product_id = 0x1003`. If the device is rec
 
 - Register buttons and knobs as Home Assistant MQTT device triggers, so actions are defined via HA automations
 - Tell double, triple and longer presses of a button apart, turned on per button from Home Assistant
-- Give a device several pages of buttons, each with its own triggers and images, and switch between them from Home Assistant
+- Give a device several pages of buttons and LCD images, each with its own triggers and images, and switch between them from Home Assistant
 - Support for multiple device models, detected automatically by USB ID
 - Run several devices at once, each with its own HA device and optionally its own settings
 - Pick up devices as they are plugged in and drop them as they are unplugged, without a restart
