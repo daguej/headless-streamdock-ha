@@ -11,8 +11,8 @@ blueprint:
     Buttons 0-14 are the key screens, numbered left to right and top to bottom,
     and buttons 15-16 are the two buttons above the LCD strip. Leave any you
     don't use empty. Double and triple presses are only reported by buttons
-    whose multi-click switch is turned on (under Configuration on the device
-    page).
+    and knobs whose multi-click switch is turned on (under Configuration on the
+    device page).
   domain: automation
   input:
     streamdock_topic:
@@ -310,6 +310,16 @@ blueprint:
           default: []
           selector:
             action: {}
+        knob_0_double_action:
+          name: Knob 0 double pressed
+          default: []
+          selector:
+            action: {}
+        knob_0_triple_action:
+          name: Knob 0 triple pressed
+          default: []
+          selector:
+            action: {}
 
 triggers:
   - trigger: mqtt
@@ -427,6 +437,10 @@ actions:
         sequence: !input knob_0_right_action
       - conditions: "{{ trigger.payload == 'knob_0_press' }}"
         sequence: !input knob_0_press_action
+      - conditions: "{{ trigger.payload == 'knob_0_press_2' }}"
+        sequence: !input knob_0_double_action
+      - conditions: "{{ trigger.payload == 'knob_0_press_3' }}"
+        sequence: !input knob_0_triple_action
 
 mode: parallel
 max: 5

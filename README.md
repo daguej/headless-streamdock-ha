@@ -208,11 +208,11 @@ Whole numbers are what Home Assistant's slider sends, and a decimal such as `39.
 
 ## Pressing a button more than once
 
-By default a button reports a press the moment it goes down, as `button_<id>_press`. To give one button separate actions for a double or triple press, turn on its "Button <id> multi-click" switch, listed under Configuration on the device page next to the image entities.
+By default a button reports a press the moment it goes down, as `button_<id>_press`, and a knob as `knob_<id>_press`. To give one button or knob separate actions for a double or triple press, turn on its "Button <id> multi-click" or "Knob <id> multi-click" switch, listed under Configuration on the device page next to the image entities.
 
-A button in multi-click mode waits until it is released, and then gives you 400ms to press it again. A press within that window is counted, and the window starts over once that press is released too, however long the button was held. Once the window runs out with no further press, the count is reported: a single press is still `button_<id>_press`, and more are `button_<id>_press_<count>` (`button_3_press_2` for a double press). A single press therefore arrives a little later than it does with the switch off, and only after the button has been released.
+A button or knob in multi-click mode waits until it is released, and then gives you 400ms to press it again. A press within that window is counted, and the window starts over once that press is released too, however long it was held. Once the window runs out with no further press, the count is reported: a single press is still `button_<id>_press` or `knob_<id>_press`, and more are `button_<id>_press_<count>` or `knob_<id>_press_<count>` (`button_3_press_2` for a double press of button 3, `knob_0_press_3` for a triple press of knob 0). A single press therefore arrives a little later than it does with the switch off, and only after it has been released. Twisting a knob is reported straight away either way.
 
-While the switch is on, the device also gets "double", "triple", "quadruple" and "quintuple" press triggers for that button, which Home Assistant's device automation editor offers alongside the usual one. They are removed again when the switch is turned off. The [blueprints](#setting-up-automations-in-home-assistant) have a double and a triple press action for every button, in their own collapsed sections. Longer runs of presses are still published on the trigger topic, but Home Assistant has no device trigger for them, so use an MQTT trigger matching the payload instead.
+While the switch is on, the device also gets "double", "triple", "quadruple" and "quintuple" press triggers for that button or knob, which Home Assistant's device automation editor offers alongside the usual one. They are removed again when the switch is turned off. The [blueprints](#setting-up-automations-in-home-assistant) have a double and a triple press action for every button, in their own collapsed sections, and for every knob, next to its other actions. Longer runs of presses are still published on the trigger topic, but Home Assistant has no device trigger for them, so use an MQTT trigger matching the payload instead.
 
 ### Switching it from an automation
 
@@ -220,6 +220,8 @@ While the switch is on, the device also gets "double", "triple", "quadruple" and
 | --- | --- |
 | `streamdock/<serial>/button/<id>/multi_click/set` | `ON` counts the button's presses, `OFF` reports each press as soon as the button goes down |
 | `streamdock/<serial>/button/<id>/multi_click` | Reports which of the two it currently is (published by the app, don't write to it) |
+| `streamdock/<serial>/knob/<id>/multi_click/set` | The same for a knob |
+| `streamdock/<serial>/knob/<id>/multi_click` | Reports the same for a knob |
 
 It takes the same payloads as the [screen timeout](#switching-it-from-an-automation), and like the timeout it survives a restart of either side when published with `retain: true`, which the switch does for you.
 
@@ -231,7 +233,7 @@ Every page is a full set of buttons with ids of their own: the buttons of each p
 
 The LCD strip is paged the same way, numbered by its own segment count: on the N1's 3-segment strip, the first page is segments 0-2, the second is 3-5, and so on, so `streamdock/<serial>/lcd/3/image/set` sets the left segment of the second page.
 
-Everything that belongs to a button or segment belongs to it on its page: a button's trigger, image entity ("Button 17 image") and multi-click switch, and a segment's image entity ("LCD segment 3 image"). They are added to Home Assistant when a page is added and removed again when it is taken away. The knobs aren't paged, they are the same whichever page is up.
+Everything that belongs to a button or segment belongs to it on its page: a button's trigger, image entity ("Button 17 image") and multi-click switch, and a segment's image entity ("LCD segment 3 image"). They are added to Home Assistant when a page is added and removed again when it is taken away. The knobs aren't paged, they are the same whichever page is up, and so is their multi-click switch.
 
 Switching pages redraws every screen, buttons and LCD strip alike, with what that page has on it, and lights the screens if they had dimmed. Images for a page that isn't showing can be set at any time; they are kept and drawn when that page comes up, and a page that is taken away and added again comes back as it was. A press is reported as the button on the page that was up when it went down, so a button that switches pages still reports its release (and counts its presses) as the button it was pressed as.
 
@@ -312,7 +314,7 @@ Which means `vendor_id = 0x6603` and `product_id = 0x1003`. If the device is rec
 ## Features
 
 - Register buttons and knobs as Home Assistant MQTT device triggers, so actions are defined via HA automations
-- Tell double, triple and longer presses of a button apart, turned on per button from Home Assistant
+- Tell double, triple and longer presses of a button or knob apart, turned on for each one from Home Assistant
 - Give a device several pages of buttons and LCD images, each with its own triggers and images, and switch between them from Home Assistant or by twisting a knob in paging mode
 - Support for multiple device models, detected automatically by USB ID
 - Run several devices at once, each with its own HA device and optionally its own settings

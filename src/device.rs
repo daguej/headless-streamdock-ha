@@ -11,12 +11,15 @@ use std::{
     future::Future,
     time::Duration,
 };
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::{
+    sync::{Mutex, broadcast, mpsc, watch},
+    time::Instant,
+};
 
 use crate::{
     config::DeviceConfig,
     icons::{self, Icon},
-    mappings::{Kind, MAX_PAGES, Screen},
+    mappings::{Control, Kind, MAX_PAGES, Screen},
     mqtt::{self, Command, MqttEvent},
 };
 
@@ -344,9 +347,9 @@ async fn session(
         dimmed: watch::Sender::new(false),
     };
 
-    // Every button reports each press straight away until Home Assistant switches it to counting
-    // them. Shared the same way the backlight is: the command loop changes it, the input loop acts
-    // on it.
+    // Every button and knob reports each press straight away until Home Assistant switches it to
+    // counting them. Shared the same way the backlight is: the command loop changes it, the input
+    // loop acts on it.
     let multi_click = watch::Sender::new(HashSet::new());
 
     // The first page is up until Home Assistant says otherwise. Only the command loop changes it,
@@ -368,8 +371,8 @@ async fn session(
 
     mqtt::publish_timeout_state(mqtt_client, serial, true).await;
     mqtt::publish_brightness_state(mqtt_client, serial, config.brightness).await;
-    mqtt::publish_multi_click_states(mqtt_client, serial, kind, 0..STARTUP_PAGES, &HashSet::new())
-        .await;
+    let controls = kind.controls(0..STARTUP_PAGES);
+    mqtt::publish_multi_click_states(mqtt_client, serial, kind, &controls, &HashSet::new()).await;
     mqtt::publish_page_count_state(mqtt_client, serial, STARTUP_PAGES).await;
     mqtt::publish_page_state(mqtt_client, serial, 0).await;
     mqtt::publish_paging_state(mqtt_client, serial, false).await;
@@ -427,10 +430,10 @@ async fn session(
 }
 
 /// Carries out what Home Assistant asks of the device for as long as it is connected: the images
-/// to put on the screens it addresses, which buttons count their presses, whether those screens may
-/// dim, how brightly they are lit, how many pages of buttons there are and which one is up, and
-/// whether the knobs turn those pages. It also turns the pages the knobs ask for in paging mode,
-/// since this is where the pages are kept.
+/// to put on the screens it addresses, which buttons and knobs count their presses, whether those
+/// screens may dim, how brightly they are lit, how many pages of buttons there are and which one is
+/// up, and whether the knobs turn those pages. It also turns the pages the knobs ask for in paging
+/// mode, since this is where the pages are kept.
 #[allow(clippy::too_many_arguments)]
 async fn command_loop(
     device: &Mutex<&Device>,
@@ -439,7 +442,7 @@ async fn command_loop(
     mqtt_client: &AsyncClient,
     events: &mut broadcast::Receiver<MqttEvent>,
     backlight: &Backlight,
-    multi_click: &watch::Sender<HashSet<u16>>,
+    multi_click: &watch::Sender<HashSet<Control>>,
     paging: &watch::Sender<bool>,
     turns: &mut mpsc::UnboundedReceiver<PageTurn>,
     mut pages: Pages<'_>,
@@ -490,14 +493,14 @@ async fn command_loop(
                     Some(Command::Brightness(percent)) => {
                         set_brightness(serial, mqtt_client, &backlight.brightness, percent).await;
                     }
-                    Some(Command::MultiClick(id, enabled)) => {
+                    Some(Command::MultiClick(control, enabled)) => {
                         set_multi_click(
                             kind,
                             serial,
                             mqtt_client,
                             multi_click,
                             pages.count,
-                            id,
+                            control,
                             enabled,
                         )
                         .await;
@@ -549,7 +552,7 @@ async fn command_loop(
                     mqtt_client,
                     serial,
                     kind,
-                    0..pages.count,
+                    &kind.controls(0..pages.count),
                     &counting,
                 )
                 .await;
@@ -581,14 +584,14 @@ async fn command_loop(
 /// device that had gone to sleep. `dimmed` is how the two keep the same idea of what state the
 /// screens are in, and how this loop hears about a wake it didn't do itself.
 ///
-/// A button reports each press as it goes down, unless it is one of those in `multi_click`. Those
-/// count their releases instead, and report how many there were once `MULTI_CLICK_WINDOW` passes
-/// without another. Either way a press is reported as the button on the page that was up when it
-/// went down.
+/// A button or knob reports each press as it goes down, unless it is one of those in `multi_click`.
+/// Those count their releases instead, and report how many there were once `MULTI_CLICK_WINDOW`
+/// passes without another. Either way a button press is reported as the button on the page that was
+/// up when it went down.
 ///
-/// A knob twist is reported the same way, unless the device is in `paging` mode. Then it turns the
-/// page instead, which is handed to the command loop through `page_turns` to carry out, and isn't
-/// reported at all. Pressing a knob is reported either way.
+/// A knob twist is reported straight away too, unless the device is in `paging` mode. Then it turns
+/// the page instead, which is handed to the command loop through `page_turns` to carry out, and
+/// isn't reported at all. Pressing a knob is reported either way.
 #[allow(clippy::too_many_arguments)]
 async fn input_loop(
     device: &Mutex<&Device>,
@@ -598,12 +601,12 @@ async fn input_loop(
     config: &DeviceConfig,
     mqtt_client: &AsyncClient,
     backlight: &Backlight,
-    multi_click: &watch::Sender<HashSet<u16>>,
+    multi_click: &watch::Sender<HashSet<Control>>,
     page: &watch::Sender<u16>,
     paging: &watch::Sender<bool>,
     page_turns: &mpsc::UnboundedSender<PageTurn>,
 ) -> Result<(), MirajazzError> {
-    use tokio::time::{Duration, Instant, sleep_until, timeout_at};
+    use tokio::time::{Duration, sleep_until, timeout_at};
 
     // We dim after `timeout` seconds of inactivity, unless the timeout is switched off.
     let idle_timeout = Duration::from_secs(config.timeout);
@@ -621,14 +624,15 @@ async fn input_loop(
     // time of the release, so a button switched over while it is held neither reports the same
     // press twice nor loses it. And the release counts for the button it was pressed as, even when
     // the page changed while it was held, which the press itself often does.
-    let mut held: HashMap<u8, u16> = HashMap::new();
-    // The presses counted so far for every button still waiting to see if another follows, and
-    // when it stops waiting. A button that is down again has no such time: it can't be done
-    // counting until it is released, however long it is held.
-    let mut presses: HashMap<u16, (u32, Option<Instant>)> = HashMap::new();
+    let mut held_buttons: HashMap<u8, u16> = HashMap::new();
+    // The same for knobs, which are the same knob on every page, so only which ones are down
+    let mut held_knobs: HashSet<u8> = HashSet::new();
+    // The presses counted so far for every button and knob still waiting to see if another
+    // follows, and when it stops waiting
+    let mut presses = Presses::new();
 
     loop {
-        // The soonest any button is done counting, copied out so the counts can change below
+        // The soonest any button or knob is done counting, copied out so the counts can change below
         let presses_due = presses.values().filter_map(|&(_, due)| due).min();
 
         // Read back rather than remembered, because the command loop wakes the screens too
@@ -690,7 +694,8 @@ async fn input_loop(
 
                 continue;
             }
-            // A button has gone long enough without another press to report the ones it counted
+            // A button or knob has gone long enough without another press to report the ones it
+            // counted
             _ = async {
                 match presses_due {
                     Some(due) => sleep_until(due).await,
@@ -701,12 +706,12 @@ async fn input_loop(
                 let done: Vec<_> = presses
                     .iter()
                     .filter(|&(_, &(_, due))| due.is_some_and(|due| due <= now))
-                    .map(|(&i, &(count, _))| (i, count))
+                    .map(|(&control, &(count, _))| (control, count))
                     .collect();
 
-                for (i, count) in done {
-                    presses.remove(&i);
-                    mqtt::handle_button(mqtt_client, serial, i, count).await;
+                for (control, count) in done {
+                    presses.remove(&control);
+                    mqtt::handle_press(mqtt_client, serial, control, count).await;
                 }
 
                 continue;
@@ -754,34 +759,15 @@ async fn input_loop(
             match update {
                 DeviceStateUpdate::ButtonDown(key) => {
                     let id = kind.button_id(*page.borrow(), key);
-                    let counting = multi_click.borrow().contains(&id);
+                    let control = Control::Button(id);
 
-                    if counting {
-                        held.insert(key, id);
-
-                        // Pressed again in time, so hold off reporting until this press is
-                        // released too, rather than letting the window run out while it is down
-                        if let Some((_, due)) = presses.get_mut(&id) {
-                            *due = None;
-                        }
-                    } else {
-                        // Presses counted before the button stopped counting them happened first,
-                        // so they are reported first
-                        if let Some((count, _)) = presses.remove(&id) {
-                            mqtt::handle_button(mqtt_client, serial, id, count).await;
-                        }
-
-                        mqtt::handle_button(mqtt_client, serial, id, 1).await;
+                    if press_down(mqtt_client, serial, multi_click, &mut presses, control).await {
+                        held_buttons.insert(key, id);
                     }
                 }
                 DeviceStateUpdate::ButtonUp(key) => {
-                    if let Some(id) = held.remove(&key) {
-                        // Every release gives the button the whole window again to be pressed once
-                        // more
-                        let count = presses.get(&id).map_or(0, |&(count, _)| count);
-                        let due = Instant::now() + MULTI_CLICK_WINDOW;
-
-                        presses.insert(id, (count + 1, Some(due)));
+                    if let Some(id) = held_buttons.remove(&key) {
+                        press_up(&mut presses, Control::Button(id));
                     }
                 }
                 DeviceStateUpdate::EncoderTwist(i, value) => {
@@ -793,12 +779,65 @@ async fn input_loop(
                     }
                 }
                 DeviceStateUpdate::EncoderDown(i) => {
-                    mqtt::handle_knob_press(mqtt_client, serial, i).await;
+                    let control = Control::Knob(i);
+
+                    if press_down(mqtt_client, serial, multi_click, &mut presses, control).await {
+                        held_knobs.insert(i);
+                    }
                 }
-                _ => {}
+                DeviceStateUpdate::EncoderUp(i) => {
+                    if held_knobs.remove(&i) {
+                        press_up(&mut presses, Control::Knob(i));
+                    }
+                }
             }
         }
     }
+}
+
+/// The presses counted so far for every button and knob still waiting to see if another follows,
+/// and when it stops waiting. One that is down again has no such time: it can't be done counting
+/// until it is released, however long it is held.
+type Presses = HashMap<Control, (u32, Option<Instant>)>;
+
+/// A button or knob going down. One that counts its presses holds off reporting anything until it
+/// is released, and says so, so its caller knows to count the release; any other is reported
+/// straight away.
+async fn press_down(
+    mqtt_client: &AsyncClient,
+    serial: &str,
+    multi_click: &watch::Sender<HashSet<Control>>,
+    presses: &mut Presses,
+    control: Control,
+) -> bool {
+    let counting = multi_click.borrow().contains(&control);
+
+    if counting {
+        // Pressed again in time, so hold off reporting until this press is released too, rather
+        // than letting the window run out while it is down
+        if let Some((_, due)) = presses.get_mut(&control) {
+            *due = None;
+        }
+    } else {
+        // Presses counted before it stopped counting them happened first, so they are reported
+        // first
+        if let Some((count, _)) = presses.remove(&control) {
+            mqtt::handle_press(mqtt_client, serial, control, count).await;
+        }
+
+        mqtt::handle_press(mqtt_client, serial, control, 1).await;
+    }
+
+    counting
+}
+
+/// A button or knob that counts its presses being released, which counts one more press. Every
+/// release gives it the whole window again to be pressed once more.
+fn press_up(presses: &mut Presses, control: Control) {
+    let count = presses.get(&control).map_or(0, |&(count, _)| count);
+    let due = Instant::now() + MULTI_CLICK_WINDOW;
+
+    presses.insert(control, (count + 1, Some(due)));
 }
 
 /// Brings the screens back up after they dimmed. The device is only recorded as lit once it says
@@ -884,8 +923,8 @@ async fn set_brightness(
     mqtt::publish_brightness_state(mqtt_client, serial, percent).await;
 }
 
-/// Switches a button between reporting each press as it goes down and counting its presses, and
-/// reports it back. The input loop is what acts on it, from the next time the button goes down.
+/// Switches a button or knob between reporting each press as it goes down and counting its presses,
+/// and reports it back. The input loop is what acts on it, from the next time it goes down.
 ///
 /// A button on a page past the last one is switched all the same, since the retained setting can
 /// arrive before the page count does, but it is only reported once the device has its page.
@@ -893,32 +932,53 @@ async fn set_multi_click(
     kind: Kind,
     serial: &str,
     mqtt_client: &AsyncClient,
-    multi_click: &watch::Sender<HashSet<u16>>,
+    multi_click: &watch::Sender<HashSet<Control>>,
     pages: u16,
-    id: u16,
+    control: Control,
     enabled: bool,
 ) {
-    let (page, _) = kind.locate_button(id);
+    let page = match control {
+        Control::Button(id) => {
+            let (page, _) = kind.locate_button(id);
 
-    if page >= MAX_PAGES {
-        println!(
-            "[{serial}] Ignoring multi-click setting for button {id}: the {} {} has {} buttons on \
-             each of up to {MAX_PAGES} pages",
-            kind.manufacturer(),
-            kind.model(),
-            kind.key_count()
-        );
+            if page >= MAX_PAGES {
+                println!(
+                    "[{serial}] Ignoring multi-click setting for button {id}: the {} {} has {} \
+                     buttons on each of up to {MAX_PAGES} pages",
+                    kind.manufacturer(),
+                    kind.model(),
+                    kind.key_count()
+                );
 
-        return;
-    }
+                return;
+            }
+
+            page
+        }
+        Control::Knob(id) => {
+            if usize::from(id) >= kind.encoder_count() {
+                println!(
+                    "[{serial}] Ignoring multi-click setting for knob {id}: the {} {} has {} knobs",
+                    kind.manufacturer(),
+                    kind.model(),
+                    kind.encoder_count()
+                );
+
+                return;
+            }
+
+            // Knobs are on every page, so the first one will do
+            0
+        }
+    };
 
     // A command that says what the setting already is happens on every reconnect, when the broker
     // replays the retained one, and isn't worth telling Home Assistant about again
-    let changed = multi_click.send_if_modified(|buttons| {
+    let changed = multi_click.send_if_modified(|controls| {
         if enabled {
-            buttons.insert(id)
+            controls.insert(control)
         } else {
-            buttons.remove(&id)
+            controls.remove(&control)
         }
     });
 
@@ -929,11 +989,11 @@ async fn set_multi_click(
     println!(
         "[{serial}] Multi-click {} for {}",
         if enabled { "enabled" } else { "disabled" },
-        kind.button_label(id)
+        kind.control_label(control)
     );
 
     if page < pages {
-        mqtt::publish_multi_click_state(mqtt_client, serial, kind, id, enabled).await;
+        mqtt::publish_multi_click_state(mqtt_client, serial, kind, control, enabled).await;
     }
 }
 
@@ -1349,7 +1409,7 @@ async fn set_page_count(
     serial: &str,
     mqtt_client: &AsyncClient,
     backlight: &Backlight,
-    multi_click: &watch::Sender<HashSet<u16>>,
+    multi_click: &watch::Sender<HashSet<Control>>,
     pages: &mut Pages<'_>,
     count: u16,
 ) -> Result<(), MirajazzError> {
@@ -1383,9 +1443,13 @@ async fn set_page_count(
             }
         }
 
+        // Only the buttons: the knobs were already there
+        let buttons: Vec<_> = (previous..count)
+            .flat_map(|page| kind.page_buttons(page))
+            .map(Control::Button)
+            .collect();
         let counting = multi_click.borrow().clone();
-        mqtt::publish_multi_click_states(mqtt_client, serial, kind, previous..count, &counting)
-            .await;
+        mqtt::publish_multi_click_states(mqtt_client, serial, kind, &buttons, &counting).await;
     } else {
         for page in count..previous {
             mqtt::remove_page_discovery(mqtt_client, serial, kind, page).await;

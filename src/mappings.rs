@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{ops::Range, time::Duration};
 
 use mirajazz::{
     device::DeviceQuery,
@@ -45,6 +45,16 @@ pub enum Kind {
 pub enum Screen {
     Button(u16),
     Lcd(u16),
+}
+
+/// Something that can be pressed: a button, or a knob pushed in.
+///
+/// A button is identified by its id across every page (see [`Kind::button_id`]), the same way its
+/// screen is. Knobs do the same thing on every page, so a knob is just which knob it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Control {
+    Button(u16),
+    Knob(u8),
 }
 
 impl Kind {
@@ -273,6 +283,24 @@ impl Kind {
 
     pub fn knob_label(&self, id: u8) -> String {
         format!("Knob {id}")
+    }
+
+    /// Human readable name of a button or knob, the same one its triggers use
+    pub fn control_label(&self, control: Control) -> String {
+        match control {
+            Control::Button(id) => self.button_label(id),
+            Control::Knob(id) => self.knob_label(id),
+        }
+    }
+
+    /// Every knob, and every button on the pages in `pages`
+    pub fn controls(&self, pages: Range<u16>) -> Vec<Control> {
+        let knobs = (0..self.encoder_count() as u8).map(Control::Knob);
+        let buttons = pages
+            .flat_map(move |page| self.page_buttons(page))
+            .map(Control::Button);
+
+        knobs.chain(buttons).collect()
     }
 }
 

@@ -1,17 +1,12 @@
 use dotenv::dotenv;
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, Publish, QoS};
 use serde_json::json;
-use std::{
-    collections::HashSet,
-    env::var,
-    ops::{Range, RangeInclusive},
-    time::Duration,
-};
+use std::{collections::HashSet, env::var, ops::RangeInclusive, time::Duration};
 use tokio::{sync::broadcast, task::JoinHandle};
 
 use crate::{
     icons::Shortened,
-    mappings::{Kind, MAX_PAGES, Screen},
+    mappings::{Control, Kind, MAX_PAGES, Screen},
 };
 
 /// Root of every topic this app uses, both the ones it publishes and the ones it listens on
@@ -54,7 +49,7 @@ const PAGING_OBJECT_ID: &str = "paging";
 const PAYLOAD_ON: &str = "ON";
 const PAYLOAD_OFF: &str = "OFF";
 
-/// Home Assistant's trigger types for a button pressed several times in a row, by how many presses
+/// Home Assistant's trigger types for a button or knob pressed several times in a row, by how many presses
 /// each stands for. It has none past five, so a longer run is still published, but only an MQTT
 /// trigger matching the payload itself (such as the blueprints use) can pick it up.
 const MULTI_PRESS_TYPES: [(u32, &str); 4] = [
@@ -74,9 +69,9 @@ pub enum Command<'a> {
     Timeout(bool),
     /// Light the screens at this percentage of full brightness
     Brightness(u8),
-    /// Count a button's presses in quick succession and report them together, or report every
-    /// press the moment the button goes down
-    MultiClick(u16, bool),
+    /// Count a button's or knob's presses in quick succession and report them together, or report
+    /// every press the moment it goes down
+    MultiClick(Control, bool),
     /// Show this page of buttons, counting from 0
     Page(u16),
     /// Give the device this many pages of buttons
@@ -194,14 +189,19 @@ fn brightness_command_topic(device_id: &str) -> String {
     format!("{}/set", brightness_topic(device_id))
 }
 
-/// Where it is reported whether a button counts its presses
-fn multi_click_topic(device_id: &str, id: u16) -> String {
-    format!("{TOPIC_ROOT}/{device_id}/button/{id}/multi_click")
+/// Where it is reported whether a button or knob counts its presses
+fn multi_click_topic(device_id: &str, control: Control) -> String {
+    let path = match control {
+        Control::Button(id) => format!("button/{id}"),
+        Control::Knob(id) => format!("knob/{id}"),
+    };
+
+    format!("{TOPIC_ROOT}/{device_id}/{path}/multi_click")
 }
 
-/// Where a button's multi-click mode is turned on and off
-fn multi_click_command_topic(device_id: &str, id: u16) -> String {
-    format!("{}/set", multi_click_topic(device_id, id))
+/// Where a button's or knob's multi-click mode is turned on and off
+fn multi_click_command_topic(device_id: &str, control: Control) -> String {
+    format!("{}/set", multi_click_topic(device_id, control))
 }
 
 /// Where the page of buttons a device is showing is reported
@@ -242,12 +242,23 @@ fn image_object_id(screen: Screen) -> String {
     }
 }
 
-/// What is published on the trigger topic when a button is pressed this many times in a row. A
-/// single press keeps the name it had before buttons could count their presses.
-fn button_press_payload(id: u16, presses: u32) -> String {
+/// Identifies a button or knob within its device, as the start of its trigger payloads and object
+/// ids
+fn control_object_id(control: Control) -> String {
+    match control {
+        Control::Button(id) => format!("button_{id}"),
+        Control::Knob(id) => format!("knob_{id}"),
+    }
+}
+
+/// What is published on the trigger topic when a button or knob is pressed this many times in a
+/// row. A single press keeps the name it had before presses could be counted.
+fn press_payload(control: Control, presses: u32) -> String {
+    let object_id = control_object_id(control);
+
     match presses {
-        1 => format!("button_{id}_press"),
-        _ => format!("button_{id}_press_{presses}"),
+        1 => format!("{object_id}_press"),
+        _ => format!("{object_id}_press_{presses}"),
     }
 }
 
@@ -262,14 +273,15 @@ fn device_info(device_id: &str, kind: Kind) -> serde_json::Value {
 }
 
 // Publishes retained HA MQTT discovery configs for one device: three triggers
-// (rotate_left/rotate_right/press) per knob, a switch for the screen timeout, a number for the
-// screen brightness, numbers for how many pages there are and which one is showing, and a switch
-// for whether the knobs turn those pages. Then, for
-// each of those pages, everything `publish_page_discovery` publishes for its buttons and screens. How many of each there are
-// depends on the model of the device.
+// (rotate_left/rotate_right/press) and a multi-click switch per knob, a switch for the screen
+// timeout, a number for the screen brightness, numbers for how many pages there are and which one
+// is showing, and a switch for whether the knobs turn those pages. Then, for each of those pages,
+// everything `publish_page_discovery` publishes for its buttons and screens. How many of each there
+// are depends on the model of the device.
 //
-// The triggers for pressing a button several times in a row come and go with its multi-click mode,
-// so they are published along with its state instead, by `publish_multi_click_states`.
+// The triggers for pressing a button or knob several times in a row come and go with its
+// multi-click mode, so they are published along with its state instead, by
+// `publish_multi_click_states`.
 pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind, pages: u16) {
     let prefix = discovery_prefix();
     let topic = trigger_topic(device_id);
@@ -306,6 +318,9 @@ pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind
             )
             .await;
         }
+
+        publish_multi_click_discovery(client, &prefix, device_id, kind, &device, Control::Knob(id))
+            .await;
     }
 
     // Retained for the same reason the images are: it is the retained command that brings the
@@ -464,7 +479,7 @@ pub async fn publish_page_discovery(client: &AsyncClient, device_id: &str, kind:
             "topic": topic,
             "type": "button_short_press",
             "subtype": kind.button_label(id),
-            "payload": button_press_payload(id, 1),
+            "payload": press_payload(Control::Button(id), 1),
             "device": device,
         });
 
@@ -483,24 +498,37 @@ pub async fn publish_page_discovery(client: &AsyncClient, device_id: &str, kind:
         publish_image_discovery(client, &prefix, device_id, &device, screen).await;
     }
 
-    // Retained like the images, so a button keeps counting its presses after either side restarts
     for id in kind.page_buttons(page) {
-        let object_id = format!("button_{id}_multi_click");
-        let payload = json!({
-            "name": format!("{} multi-click", kind.button_label(id)),
-            "unique_id": format!("{TOPIC_ROOT}_{device_id}_{object_id}"),
-            "command_topic": multi_click_command_topic(device_id, id),
-            "state_topic": multi_click_topic(device_id, id),
-            "payload_on": PAYLOAD_ON,
-            "payload_off": PAYLOAD_OFF,
-            "retain": true,
-            "entity_category": "config",
-            "icon": "mdi:gesture-double-tap",
-            "device": device,
-        });
-
-        publish_discovery_config(client, &prefix, "switch", device_id, &object_id, &payload).await;
+        let control = Control::Button(id);
+        publish_multi_click_discovery(client, &prefix, device_id, kind, &device, control).await;
     }
+}
+
+/// Publishes the switch that turns a button's or knob's multi-click mode on and off. Retained like
+/// the images, so it keeps counting its presses after either side restarts.
+async fn publish_multi_click_discovery(
+    client: &AsyncClient,
+    prefix: &str,
+    device_id: &str,
+    kind: Kind,
+    device: &serde_json::Value,
+    control: Control,
+) {
+    let object_id = format!("{}_multi_click", control_object_id(control));
+    let payload = json!({
+        "name": format!("{} multi-click", kind.control_label(control)),
+        "unique_id": format!("{TOPIC_ROOT}_{device_id}_{object_id}"),
+        "command_topic": multi_click_command_topic(device_id, control),
+        "state_topic": multi_click_topic(device_id, control),
+        "payload_on": PAYLOAD_ON,
+        "payload_off": PAYLOAD_OFF,
+        "retain": true,
+        "entity_category": "config",
+        "icon": "mdi:gesture-double-tap",
+        "device": device,
+    });
+
+    publish_discovery_config(client, prefix, "switch", device_id, &object_id, &payload).await;
 }
 
 /// Takes back everything `publish_page_discovery` and `publish_multi_click_state` published for
@@ -512,7 +540,7 @@ pub async fn remove_page_discovery(client: &AsyncClient, device_id: &str, kind: 
         let triggers = std::iter::once(format!("button_{id}")).chain(
             MULTI_PRESS_TYPES
                 .iter()
-                .map(|(presses, _)| format!("button_{id}_press_{presses}")),
+                .map(|&(presses, _)| press_payload(Control::Button(id), presses)),
         );
 
         for object_id in triggers {
@@ -586,7 +614,7 @@ async fn remove_discovery_config(
 }
 
 /// Asks for the commands addressed to one device: how many pages of buttons it has and which one
-/// it shows, the images for its screens, which of its buttons count their presses, the state of its
+/// it shows, the images for its screens, which of its buttons and knobs count their presses, the state of its
 /// screen timeout, the brightness its screens are lit at and whether its knobs turn the pages.
 ///
 /// This has to be repeated on every new connection, because an MQTT session starts with no
@@ -598,12 +626,12 @@ pub async fn subscribe_commands(client: &AsyncClient, device_id: &str) {
     // page exists.
     //
     // One filter covers every screen: the image commands only differ in the button/lcd path. And
-    // one covers every button's multi-click mode, which only differ in the button id.
+    // one covers every button's and knob's multi-click mode, which differ the same way.
     let filters = [
         page_count_command_topic(device_id),
         page_command_topic(device_id),
         format!("{TOPIC_ROOT}/{device_id}/+/+/image/set"),
-        format!("{TOPIC_ROOT}/{device_id}/button/+/multi_click/set"),
+        format!("{TOPIC_ROOT}/{device_id}/+/+/multi_click/set"),
         timeout_command_topic(device_id),
         brightness_command_topic(device_id),
         paging_command_topic(device_id),
@@ -627,9 +655,9 @@ fn parse_command<'a>(topic: &str, payload: &'a [u8], device_id: &str) -> Option<
         return Some(Command::Image(screen, payload));
     }
 
-    if let Some(id) = parse_multi_click_command(topic, device_id) {
+    if let Some(control) = parse_multi_click_command(topic, device_id) {
         return parse_switch(payload, device_id, "multi-click")
-            .map(|enabled| Command::MultiClick(id, enabled));
+            .map(|enabled| Command::MultiClick(control, enabled));
     }
 
     if topic == timeout_command_topic(device_id) {
@@ -755,16 +783,20 @@ fn parse_image_command(topic: &str, device_id: &str) -> Option<Screen> {
     }
 }
 
-/// Picks out which button a multi-click command is for
-fn parse_multi_click_command(topic: &str, device_id: &str) -> Option<u16> {
-    topic
+/// Picks out which button or knob a multi-click command is for
+fn parse_multi_click_command(topic: &str, device_id: &str) -> Option<Control> {
+    let rest = topic
         .strip_prefix(TOPIC_ROOT)?
         .strip_prefix('/')?
         .strip_prefix(device_id)?
-        .strip_prefix("/button/")?
-        .strip_suffix("/multi_click/set")?
-        .parse()
-        .ok()
+        .strip_prefix('/')?
+        .strip_suffix("/multi_click/set")?;
+
+    match rest.split_once('/')? {
+        ("button", id) => id.parse().ok().map(Control::Button),
+        ("knob", id) => id.parse().ok().map(Control::Knob),
+        _ => None,
+    }
 }
 
 /// Reports what a screen is showing, so the Home Assistant entity for it matches the device.
@@ -873,45 +905,49 @@ pub async fn publish_page_count_state(client: &AsyncClient, device_id: &str, pag
         .unwrap_or_else(|_| println!("[{device_id}] Failed to publish the page count state"));
 }
 
-/// Reports whether each of the buttons on some of a device's pages counts its presses, so the Home
+/// Reports whether each of some of a device's buttons and knobs counts its presses, so the Home
 /// Assistant switches match the device. Retained, like the other settings.
 ///
-/// Also publishes the triggers for pressing a button several times in a row for the buttons that
-/// count their presses, and takes them back for the ones that don't, so a device only offers the
-/// triggers that can actually fire.
+/// Also publishes the triggers for pressing one several times in a row for the ones that count
+/// their presses, and takes them back for the ones that don't, so a device only offers the triggers
+/// that can actually fire.
 pub async fn publish_multi_click_states(
     client: &AsyncClient,
     device_id: &str,
     kind: Kind,
-    pages: Range<u16>,
-    enabled: &HashSet<u16>,
+    controls: &[Control],
+    enabled: &HashSet<Control>,
 ) {
-    for id in pages.flat_map(|page| kind.page_buttons(page)) {
-        publish_multi_click_state(client, device_id, kind, id, enabled.contains(&id)).await;
+    for &control in controls {
+        let counting = enabled.contains(&control);
+        publish_multi_click_state(client, device_id, kind, control, counting).await;
     }
 }
 
-/// Reports whether one button counts its presses, and publishes or takes back its triggers for
-/// being pressed several times in a row to match. See `publish_multi_click_states`.
+/// Reports whether one button or knob counts its presses, and publishes or takes back its triggers
+/// for being pressed several times in a row to match. See `publish_multi_click_states`.
 pub async fn publish_multi_click_state(
     client: &AsyncClient,
     device_id: &str,
     kind: Kind,
-    id: u16,
+    control: Control,
     enabled: bool,
 ) {
     let state = if enabled { PAYLOAD_ON } else { PAYLOAD_OFF };
 
     client
         .publish(
-            multi_click_topic(device_id, id),
+            multi_click_topic(device_id, control),
             QoS::AtLeastOnce,
             true,
             state,
         )
         .await
         .unwrap_or_else(|_| {
-            println!("[{device_id}] Failed to publish the multi-click state of button {id}")
+            println!(
+                "[{device_id}] Failed to publish the multi-click state of {}",
+                kind.control_label(control)
+            )
         });
 
     let prefix = discovery_prefix();
@@ -919,7 +955,8 @@ pub async fn publish_multi_click_state(
     let device = device_info(device_id, kind);
 
     for (presses, trigger_type) in MULTI_PRESS_TYPES {
-        let object_id = format!("button_{id}_press_{presses}");
+        // The payload is already unique within the device, so it doubles as the object id
+        let object_id = press_payload(control, presses);
 
         if !enabled {
             remove_discovery_config(client, &prefix, "device_automation", device_id, &object_id)
@@ -933,8 +970,8 @@ pub async fn publish_multi_click_state(
             "platform": "device_automation",
             "topic": topic,
             "type": trigger_type,
-            "subtype": kind.button_label(id),
-            "payload": button_press_payload(id, presses),
+            "subtype": kind.control_label(control),
+            "payload": press_payload(control, presses),
             "device": device,
         });
 
@@ -950,19 +987,15 @@ pub async fn publish_multi_click_state(
     }
 }
 
-/// Reports a button being pressed this many times in a row, which is always once for a button
+/// Reports a button or knob being pressed this many times in a row, which is always once for one
 /// that doesn't count its presses
-pub async fn handle_button(client: &AsyncClient, device_id: &str, i: u16, presses: u32) {
-    publish_trigger(client, device_id, &button_press_payload(i, presses)).await;
+pub async fn handle_press(client: &AsyncClient, device_id: &str, control: Control, presses: u32) {
+    publish_trigger(client, device_id, &press_payload(control, presses)).await;
 }
 
 pub async fn handle_knob(client: &AsyncClient, device_id: &str, i: u8, value: i8) {
     let suffix = if value > 0 { "right" } else { "left" };
     publish_trigger(client, device_id, &format!("knob_{i}_{suffix}")).await;
-}
-
-pub async fn handle_knob_press(client: &AsyncClient, device_id: &str, i: u8) {
-    publish_trigger(client, device_id, &format!("knob_{i}_press")).await;
 }
 
 async fn publish_trigger(client: &AsyncClient, device_id: &str, payload: &str) {
@@ -1066,18 +1099,23 @@ mod tests {
     }
 
     #[test]
-    fn a_multi_click_command_names_the_button_it_addresses() {
-        // Including buttons past the first page
-        for id in [0, 8, 16, 17, 271] {
-            let topic = multi_click_command_topic(SERIAL, id);
+    fn a_multi_click_command_names_the_button_or_knob_it_addresses() {
+        // Including buttons past the first page, and a knob with the same number as a button
+        let controls = [0, 8, 16, 17, 271]
+            .map(Control::Button)
+            .into_iter()
+            .chain([0, 2].map(Control::Knob));
+
+        for control in controls {
+            let topic = multi_click_command_topic(SERIAL, control);
 
             assert_eq!(
                 parse_command(&topic, b"ON", SERIAL),
-                Some(Command::MultiClick(id, true))
+                Some(Command::MultiClick(control, true))
             );
             assert_eq!(
                 parse_command(&topic, b"OFF", SERIAL),
-                Some(Command::MultiClick(id, false))
+                Some(Command::MultiClick(control, false))
             );
         }
     }
@@ -1085,8 +1123,10 @@ mod tests {
     #[test]
     fn the_multi_click_command_is_not_mistaken_for_an_image() {
         // The image filter's `+/+` sits at the same depth, so the two must not swallow each other
-        let topic = multi_click_command_topic(SERIAL, 0);
-        assert_eq!(parse_image_command(&topic, SERIAL), None);
+        for control in [Control::Button(0), Control::Knob(0)] {
+            let topic = multi_click_command_topic(SERIAL, control);
+            assert_eq!(parse_image_command(&topic, SERIAL), None);
+        }
 
         let image = image_command_topic(SERIAL, Screen::Button(0));
         assert_eq!(parse_multi_click_command(&image, SERIAL), None);
@@ -1096,14 +1136,17 @@ mod tests {
     fn topics_that_are_not_multi_click_commands_are_ignored() {
         for topic in [
             // The state it reports, rather than the command
-            &multi_click_topic(SERIAL, 0),
+            &multi_click_topic(SERIAL, Control::Button(0)),
             // Another device's button
-            &multi_click_command_topic("CL87654321", 0),
-            // Only buttons count presses
+            &multi_click_command_topic("CL87654321", Control::Button(0)),
+            // Only buttons and knobs count presses
             &format!("{TOPIC_ROOT}/{SERIAL}/lcd/0/multi_click/set"),
-            // A button id that isn't a number, or doesn't fit one
+            // An id that isn't a number, or doesn't fit one
             &format!("{TOPIC_ROOT}/{SERIAL}/button/left/multi_click/set"),
             &format!("{TOPIC_ROOT}/{SERIAL}/button/70000/multi_click/set"),
+            &format!("{TOPIC_ROOT}/{SERIAL}/knob/256/multi_click/set"),
+            // Missing the id altogether
+            &format!("{TOPIC_ROOT}/{SERIAL}/knob/multi_click/set"),
             // A serial that merely starts with ours
             &format!("{TOPIC_ROOT}/{SERIAL}9/button/0/multi_click/set"),
         ] {
@@ -1117,9 +1160,11 @@ mod tests {
 
     #[test]
     fn a_single_press_keeps_its_name_and_more_are_numbered() {
-        assert_eq!(button_press_payload(3, 1), "button_3_press");
-        assert_eq!(button_press_payload(3, 2), "button_3_press_2");
-        assert_eq!(button_press_payload(16, 7), "button_16_press_7");
+        assert_eq!(press_payload(Control::Button(3), 1), "button_3_press");
+        assert_eq!(press_payload(Control::Button(3), 2), "button_3_press_2");
+        assert_eq!(press_payload(Control::Button(16), 7), "button_16_press_7");
+        assert_eq!(press_payload(Control::Knob(0), 1), "knob_0_press");
+        assert_eq!(press_payload(Control::Knob(2), 3), "knob_2_press_3");
     }
 
     #[test]

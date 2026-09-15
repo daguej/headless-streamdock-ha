@@ -10,8 +10,8 @@ blueprint:
     -> your Stream Dock device), or just use `streamdock/<serial>/trigger`.
     Buttons are numbered 0-8 and knobs 0-2, matching the physical device;
     leave any you don't use empty. Double and triple presses are only reported
-    by buttons whose multi-click switch is turned on (under Configuration on the
-    device page).
+    by buttons and knobs whose multi-click switch is turned on (under
+    Configuration on the device page).
   domain: automation
   input:
     streamdock_topic:
@@ -189,6 +189,16 @@ blueprint:
           default: []
           selector:
             action: {}
+        knob_0_double_action:
+          name: Knob 0 double pressed
+          default: []
+          selector:
+            action: {}
+        knob_0_triple_action:
+          name: Knob 0 triple pressed
+          default: []
+          selector:
+            action: {}
         knob_1_left_action:
           name: Knob 1 rotated left
           default: []
@@ -204,6 +214,16 @@ blueprint:
           default: []
           selector:
             action: {}
+        knob_1_double_action:
+          name: Knob 1 double pressed
+          default: []
+          selector:
+            action: {}
+        knob_1_triple_action:
+          name: Knob 1 triple pressed
+          default: []
+          selector:
+            action: {}
         knob_2_left_action:
           name: Knob 2 rotated left
           default: []
@@ -216,6 +236,16 @@ blueprint:
             action: {}
         knob_2_press_action:
           name: Knob 2 pressed
+          default: []
+          selector:
+            action: {}
+        knob_2_double_action:
+          name: Knob 2 double pressed
+          default: []
+          selector:
+            action: {}
+        knob_2_triple_action:
+          name: Knob 2 triple pressed
           default: []
           selector:
             action: {}
@@ -288,18 +318,30 @@ actions:
         sequence: !input knob_0_right_action
       - conditions: "{{ trigger.payload == 'knob_0_press' }}"
         sequence: !input knob_0_press_action
+      - conditions: "{{ trigger.payload == 'knob_0_press_2' }}"
+        sequence: !input knob_0_double_action
+      - conditions: "{{ trigger.payload == 'knob_0_press_3' }}"
+        sequence: !input knob_0_triple_action
       - conditions: "{{ trigger.payload == 'knob_1_left' }}"
         sequence: !input knob_1_left_action
       - conditions: "{{ trigger.payload == 'knob_1_right' }}"
         sequence: !input knob_1_right_action
       - conditions: "{{ trigger.payload == 'knob_1_press' }}"
         sequence: !input knob_1_press_action
+      - conditions: "{{ trigger.payload == 'knob_1_press_2' }}"
+        sequence: !input knob_1_double_action
+      - conditions: "{{ trigger.payload == 'knob_1_press_3' }}"
+        sequence: !input knob_1_triple_action
       - conditions: "{{ trigger.payload == 'knob_2_left' }}"
         sequence: !input knob_2_left_action
       - conditions: "{{ trigger.payload == 'knob_2_right' }}"
         sequence: !input knob_2_right_action
       - conditions: "{{ trigger.payload == 'knob_2_press' }}"
         sequence: !input knob_2_press_action
+      - conditions: "{{ trigger.payload == 'knob_2_press_2' }}"
+        sequence: !input knob_2_double_action
+      - conditions: "{{ trigger.payload == 'knob_2_press_3' }}"
+        sequence: !input knob_2_triple_action
 
 mode: parallel
 max: 5
