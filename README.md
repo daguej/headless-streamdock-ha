@@ -241,10 +241,10 @@ Switching pages redraws every screen, buttons and LCD strip alike, with what tha
 | --- | --- |
 | `streamdock/<serial>/page_count/set` | Gives the device this many pages, 1-16 |
 | `streamdock/<serial>/page_count` | Reports how many pages it has (published by the app, don't write to it) |
-| `streamdock/<serial>/page/set` | Shows this page, counting from 0 |
+| `streamdock/<serial>/page/set` | Shows this page, counting from 0. The app also publishes to it when a knob [turns the page](#turning-pages-with-the-knob) |
 | `streamdock/<serial>/page` | Reports the page that is showing (published by the app, don't write to it) |
 
-A knob or button that flips through the pages is a short automation:
+A knob or button that flips through the pages is a short automation (though for a knob, [paging mode](#turning-pages-with-the-knob) does it without one):
 
 ```yaml
 triggers:
@@ -262,6 +262,30 @@ actions:
 Both take whole numbers, like the [brightness](#setting-it-from-an-automation). A page the device doesn't have is logged and ignored, and a device showing a page that is taken away moves to the last page it still has. Publish with `retain: true` (which the numbers do for you) and both survive a restart of either side.
 
 The [blueprints](#setting-up-automations-in-home-assistant) only have actions for the first page. Buttons on later pages have device triggers of their own, or can be matched with an MQTT trigger on their payload.
+
+### Turning pages with the knob
+
+Each device also gets a "Paging mode" switch, listed under Configuration next to "Page" and "Page count". While it is on, twisting a knob turns the page on the device itself: right goes to the next page and left to the previous one. A twist left on the first page, or right on the last, does nothing. Every knob turns the pages this way, on devices that have more than one.
+
+A twist that turns the page isn't reported to Home Assistant, so the knob's usual `knob_<id>_left`/`knob_<id>_right` automations don't run while paging mode is on. Pressing a knob is still reported, which makes it a handy way to leave paging mode again. The page the knob lands on is reported on `streamdock/<serial>/page` like any other page change, and is also published to `streamdock/<serial>/page/set`, retained, so the device stays on that page when it or the broker reconnects rather than going back to the last page Home Assistant picked. A knob spun quickly draws only the page it ends up on.
+
+| Topic | What it does |
+| --- | --- |
+| `streamdock/<serial>/paging/set` | `ON` has the knobs turn the pages, `OFF` has them report their twists |
+| `streamdock/<serial>/paging` | Reports which of the two it currently is (published by the app, don't write to it) |
+
+It takes the same payloads as the [screen timeout](#switching-it-from-an-automation), and survives a restart of either side when published with `retain: true`, which the switch does for you. For example, to toggle paging mode with a knob press:
+
+```yaml
+triggers:
+  - trigger: mqtt
+    topic: streamdock/AL12345678/trigger
+    payload: knob_0_press
+actions:
+  - action: switch.toggle
+    target:
+      entity_id: switch.stream_dock_al12345678_paging_mode
+```
 
 ## Setting up automations in Home Assistant
 
@@ -289,7 +313,7 @@ Which means `vendor_id = 0x6603` and `product_id = 0x1003`. If the device is rec
 
 - Register buttons and knobs as Home Assistant MQTT device triggers, so actions are defined via HA automations
 - Tell double, triple and longer presses of a button apart, turned on per button from Home Assistant
-- Give a device several pages of buttons and LCD images, each with its own triggers and images, and switch between them from Home Assistant
+- Give a device several pages of buttons and LCD images, each with its own triggers and images, and switch between them from Home Assistant or by twisting a knob in paging mode
 - Support for multiple device models, detected automatically by USB ID
 - Run several devices at once, each with its own HA device and optionally its own settings
 - Pick up devices as they are plugged in and drop them as they are unplugged, without a restart

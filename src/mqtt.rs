@@ -47,6 +47,9 @@ const PAGE_OBJECT_ID: &str = "page";
 /// Identifies the entity for how many pages a device has within its device
 const PAGE_COUNT_OBJECT_ID: &str = "page_count";
 
+/// Identifies the paging mode entity within its device
+const PAGING_OBJECT_ID: &str = "paging";
+
 /// What Home Assistant's switch sends and expects by default, and what this app reports
 const PAYLOAD_ON: &str = "ON";
 const PAYLOAD_OFF: &str = "OFF";
@@ -78,6 +81,9 @@ pub enum Command<'a> {
     Page(u16),
     /// Give the device this many pages of buttons
     PageCount(u16),
+    /// Have twisting a knob turn the pages instead of reporting the twist, or go back to reporting
+    /// it
+    Paging(bool),
 }
 
 /// Something that happened on the MQTT connection and that the devices need to know about
@@ -218,6 +224,16 @@ fn page_count_command_topic(device_id: &str) -> String {
     format!("{}/set", page_count_topic(device_id))
 }
 
+/// Where it is reported whether the knobs turn the pages
+fn paging_topic(device_id: &str) -> String {
+    format!("{TOPIC_ROOT}/{device_id}/paging")
+}
+
+/// Where paging mode is turned on and off
+fn paging_command_topic(device_id: &str) -> String {
+    format!("{}/set", paging_topic(device_id))
+}
+
 /// Identifies a screen's entity within its device
 fn image_object_id(screen: Screen) -> String {
     match screen {
@@ -247,7 +263,8 @@ fn device_info(device_id: &str, kind: Kind) -> serde_json::Value {
 
 // Publishes retained HA MQTT discovery configs for one device: three triggers
 // (rotate_left/rotate_right/press) per knob, a switch for the screen timeout, a number for the
-// screen brightness, and numbers for how many pages there are and which one is showing. Then, for
+// screen brightness, numbers for how many pages there are and which one is showing, and a switch
+// for whether the knobs turn those pages. Then, for
 // each of those pages, everything `publish_page_discovery` publishes for its buttons and screens. How many of each there are
 // depends on the model of the device.
 //
@@ -371,6 +388,30 @@ pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind
     .await;
 
     publish_page_number_discovery(client, device_id, kind, pages).await;
+
+    // Retained like the rest, so a device left in paging mode is still in it after a restart
+    let payload = json!({
+        "name": "Paging mode",
+        "unique_id": format!("{TOPIC_ROOT}_{device_id}_{PAGING_OBJECT_ID}"),
+        "command_topic": paging_command_topic(device_id),
+        "state_topic": paging_topic(device_id),
+        "payload_on": PAYLOAD_ON,
+        "payload_off": PAYLOAD_OFF,
+        "retain": true,
+        "entity_category": "config",
+        "icon": "mdi:knob",
+        "device": device,
+    });
+
+    publish_discovery_config(
+        client,
+        &prefix,
+        "switch",
+        device_id,
+        PAGING_OBJECT_ID,
+        &payload,
+    )
+    .await;
 }
 
 /// Publishes the discovery config for the number that picks the page a device shows. Its range
@@ -546,7 +587,7 @@ async fn remove_discovery_config(
 
 /// Asks for the commands addressed to one device: how many pages of buttons it has and which one
 /// it shows, the images for its screens, which of its buttons count their presses, the state of its
-/// screen timeout and the brightness its screens are lit at.
+/// screen timeout, the brightness its screens are lit at and whether its knobs turn the pages.
 ///
 /// This has to be repeated on every new connection, because an MQTT session starts with no
 /// subscriptions. The broker replays the retained commands each time, which is what restores the
@@ -565,6 +606,7 @@ pub async fn subscribe_commands(client: &AsyncClient, device_id: &str) {
         format!("{TOPIC_ROOT}/{device_id}/button/+/multi_click/set"),
         timeout_command_topic(device_id),
         brightness_command_topic(device_id),
+        paging_command_topic(device_id),
     ];
 
     for filter in filters {
@@ -605,6 +647,10 @@ fn parse_command<'a>(topic: &str, payload: &'a [u8], device_id: &str) -> Option<
     if topic == page_count_command_topic(device_id) {
         return parse_number(payload, device_id, "page count", 1..=MAX_PAGES)
             .map(Command::PageCount);
+    }
+
+    if topic == paging_command_topic(device_id) {
+        return parse_switch(payload, device_id, "paging mode").map(Command::Paging);
     }
 
     None
@@ -784,6 +830,33 @@ pub async fn publish_page_state(client: &AsyncClient, device_id: &str, page: u16
         )
         .await
         .unwrap_or_else(|_| println!("[{device_id}] Failed to publish the page state"));
+}
+
+/// Asks for the page a knob turned the device to, the way Home Assistant would. Retained, as Home
+/// Assistant's own command is, which is the point: the broker hands the retained command back on
+/// every reconnect, and it has to be the page the device is on rather than the last one Home
+/// Assistant asked for, or the device would turn back to that one.
+pub async fn publish_page_command(client: &AsyncClient, device_id: &str, page: u16) {
+    client
+        .publish(
+            page_command_topic(device_id),
+            QoS::AtLeastOnce,
+            true,
+            page.to_string(),
+        )
+        .await
+        .unwrap_or_else(|_| println!("[{device_id}] Failed to publish the page command"));
+}
+
+/// Reports whether the knobs turn the pages, so the Home Assistant switch matches the device.
+/// Retained, like the other settings.
+pub async fn publish_paging_state(client: &AsyncClient, device_id: &str, enabled: bool) {
+    let payload = if enabled { PAYLOAD_ON } else { PAYLOAD_OFF };
+
+    client
+        .publish(paging_topic(device_id), QoS::AtLeastOnce, true, payload)
+        .await
+        .unwrap_or_else(|_| println!("[{device_id}] Failed to publish the paging mode state"));
 }
 
 /// Reports how many pages of buttons a device has, so the Home Assistant number matches the device.
@@ -1167,6 +1240,35 @@ mod tests {
         for payload in ["0", "", "-1", &(MAX_PAGES + 1).to_string()] {
             assert_eq!(parse_command(&count, payload.as_bytes(), SERIAL), None);
         }
+    }
+
+    #[test]
+    fn the_paging_mode_command_is_told_apart_from_the_rest() {
+        let topic = paging_command_topic(SERIAL);
+
+        assert_eq!(
+            parse_command(&topic, b"ON", SERIAL),
+            Some(Command::Paging(true))
+        );
+        assert_eq!(
+            parse_command(&topic, b"off", SERIAL),
+            Some(Command::Paging(false))
+        );
+        assert_eq!(parse_command(&topic, b"", SERIAL), None);
+
+        // The page command sits right next to it, and is still the page's
+        assert_eq!(parse_image_command(&topic, SERIAL), None);
+        assert_eq!(
+            parse_command(&page_command_topic(SERIAL), b"1", SERIAL),
+            Some(Command::Page(1))
+        );
+
+        // Nor is the state it reports, or another device's command
+        assert_eq!(parse_command(&paging_topic(SERIAL), b"ON", SERIAL), None);
+        assert_eq!(
+            parse_command(&paging_command_topic("CL87654321"), b"ON", SERIAL),
+            None
+        );
     }
 
     #[test]

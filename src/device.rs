@@ -7,11 +7,11 @@ use mirajazz::{
 };
 use rumqttc::AsyncClient;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     time::Duration,
 };
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
 use crate::{
     config::DeviceConfig,
@@ -261,6 +261,37 @@ struct Pages<'a> {
     /// are kept too, so an image that arrives before the page count does isn't lost, and a page
     /// that is taken away comes back as it was.
     images: HashMap<Screen, Picture>,
+    /// The pages a knob turned to that we published as the page command ourselves, oldest first,
+    /// and that haven't come back to us from the broker yet
+    echoes: VecDeque<u16>,
+}
+
+/// Which way a knob in paging mode was twisted
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageTurn {
+    Next,
+    Previous,
+}
+
+impl PageTurn {
+    /// A knob twisted right, with a positive value, goes on to the next page
+    fn from_twist(value: i8) -> Self {
+        if value > 0 {
+            PageTurn::Next
+        } else {
+            PageTurn::Previous
+        }
+    }
+
+    /// The page this turn lands on from `page`, out of `count` pages. There is nothing past the
+    /// first or last page, so a turn that would go there stays where it is.
+    fn apply(self, page: u16, count: u16) -> u16 {
+        match self {
+            PageTurn::Next if page + 1 < count => page + 1,
+            PageTurn::Previous if page > 0 => page - 1,
+            _ => page,
+        }
+    }
 }
 
 /// Sets the device up and then reads from it until it goes away or we're asked to shut down.
@@ -325,7 +356,15 @@ async fn session(
         count: STARTUP_PAGES,
         current: &page,
         images,
+        echoes: VecDeque::new(),
     };
+
+    // Twisting a knob reports the twist until Home Assistant puts the device into paging mode, when
+    // it turns the pages instead. Shared like multi-click: the command loop switches it, and the
+    // input loop acts on it by handing the turns back to the command loop, which is the one that
+    // knows how many pages there are and draws them.
+    let paging = watch::Sender::new(false);
+    let (page_turns, mut turns) = mpsc::unbounded_channel();
 
     mqtt::publish_timeout_state(mqtt_client, serial, true).await;
     mqtt::publish_brightness_state(mqtt_client, serial, config.brightness).await;
@@ -333,6 +372,7 @@ async fn session(
         .await;
     mqtt::publish_page_count_state(mqtt_client, serial, STARTUP_PAGES).await;
     mqtt::publish_page_state(mqtt_client, serial, 0).await;
+    mqtt::publish_paging_state(mqtt_client, serial, false).await;
 
     // Only ask for the commands Home Assistant has retained once the configured images are on the
     // device, so they arrive afterwards and take over rather than being overwritten
@@ -362,6 +402,8 @@ async fn session(
         &backlight,
         &multi_click,
         &page,
+        &paging,
+        &page_turns,
     );
     let commands = command_loop(
         &device,
@@ -371,6 +413,8 @@ async fn session(
         mqtt_events,
         &backlight,
         &multi_click,
+        &paging,
+        &mut turns,
         pages,
     );
 
@@ -384,7 +428,9 @@ async fn session(
 
 /// Carries out what Home Assistant asks of the device for as long as it is connected: the images
 /// to put on the screens it addresses, which buttons count their presses, whether those screens may
-/// dim, how brightly they are lit, and how many pages of buttons there are and which one is up
+/// dim, how brightly they are lit, how many pages of buttons there are and which one is up, and
+/// whether the knobs turn those pages. It also turns the pages the knobs ask for in paging mode,
+/// since this is where the pages are kept.
 #[allow(clippy::too_many_arguments)]
 async fn command_loop(
     device: &Mutex<&Device>,
@@ -394,12 +440,34 @@ async fn command_loop(
     events: &mut broadcast::Receiver<MqttEvent>,
     backlight: &Backlight,
     multi_click: &watch::Sender<HashSet<u16>>,
+    paging: &watch::Sender<bool>,
+    turns: &mut mpsc::UnboundedReceiver<PageTurn>,
     mut pages: Pages<'_>,
 ) -> Result<(), MirajazzError> {
     use broadcast::error::RecvError;
 
     loop {
-        match events.recv().await {
+        let event = tokio::select! {
+            event = events.recv() => event,
+            // The input loop is only gone once the session is ending, and this with it
+            Some(turn) = turns.recv() => {
+                turn_page(
+                    device,
+                    kind,
+                    serial,
+                    mqtt_client,
+                    backlight,
+                    &mut pages,
+                    turn,
+                    turns,
+                )
+                .await?;
+
+                continue;
+            }
+        };
+
+        match event {
             Ok(MqttEvent::Message(publish)) => {
                 // Every device sees every message, so most of them are somebody else's
                 match mqtt::command(&publish, serial) {
@@ -435,8 +503,16 @@ async fn command_loop(
                         .await;
                     }
                     Some(Command::Page(page)) => {
-                        set_page(device, kind, serial, mqtt_client, backlight, &pages, page)
-                            .await?;
+                        set_page(
+                            device,
+                            kind,
+                            serial,
+                            mqtt_client,
+                            backlight,
+                            &mut pages,
+                            page,
+                        )
+                        .await?;
                     }
                     Some(Command::PageCount(count)) => {
                         set_page_count(
@@ -451,6 +527,9 @@ async fn command_loop(
                         )
                         .await?;
                     }
+                    Some(Command::Paging(enabled)) => {
+                        set_paging(serial, mqtt_client, paging, enabled).await;
+                    }
                     None => {}
                 }
             }
@@ -461,6 +540,7 @@ async fn command_loop(
                 let percent = *backlight.brightness.borrow();
                 let counting = multi_click.borrow().clone();
                 let page = *pages.current.borrow();
+                let turning = *paging.borrow();
 
                 mqtt::publish_discovery(mqtt_client, serial, kind, pages.count).await;
                 mqtt::publish_timeout_state(mqtt_client, serial, enabled).await;
@@ -475,6 +555,7 @@ async fn command_loop(
                 .await;
                 mqtt::publish_page_count_state(mqtt_client, serial, pages.count).await;
                 mqtt::publish_page_state(mqtt_client, serial, page).await;
+                mqtt::publish_paging_state(mqtt_client, serial, turning).await;
                 mqtt::subscribe_commands(mqtt_client, serial).await;
             }
             // Images are big, so only a few are kept waiting. Dropping the ones this device
@@ -504,6 +585,10 @@ async fn command_loop(
 /// count their releases instead, and report how many there were once `MULTI_CLICK_WINDOW` passes
 /// without another. Either way a press is reported as the button on the page that was up when it
 /// went down.
+///
+/// A knob twist is reported the same way, unless the device is in `paging` mode. Then it turns the
+/// page instead, which is handed to the command loop through `page_turns` to carry out, and isn't
+/// reported at all. Pressing a knob is reported either way.
 #[allow(clippy::too_many_arguments)]
 async fn input_loop(
     device: &Mutex<&Device>,
@@ -515,6 +600,8 @@ async fn input_loop(
     backlight: &Backlight,
     multi_click: &watch::Sender<HashSet<u16>>,
     page: &watch::Sender<u16>,
+    paging: &watch::Sender<bool>,
+    page_turns: &mpsc::UnboundedSender<PageTurn>,
 ) -> Result<(), MirajazzError> {
     use tokio::time::{Duration, Instant, sleep_until, timeout_at};
 
@@ -698,7 +785,12 @@ async fn input_loop(
                     }
                 }
                 DeviceStateUpdate::EncoderTwist(i, value) => {
-                    mqtt::handle_knob(mqtt_client, serial, i, value).await;
+                    if *paging.borrow() {
+                        // Only fails once the command loop is gone, which ends the session anyway
+                        let _ = page_turns.send(PageTurn::from_twist(value));
+                    } else {
+                        mqtt::handle_knob(mqtt_client, serial, i, value).await;
+                    }
                 }
                 DeviceStateUpdate::EncoderDown(i) => {
                     mqtt::handle_knob_press(mqtt_client, serial, i).await;
@@ -843,6 +935,35 @@ async fn set_multi_click(
     if page < pages {
         mqtt::publish_multi_click_state(mqtt_client, serial, kind, id, enabled).await;
     }
+}
+
+/// Switches the knobs between reporting their twists and turning the pages, and reports it back.
+/// The input loop is what acts on it, from the next twist.
+async fn set_paging(
+    serial: &str,
+    mqtt_client: &AsyncClient,
+    paging: &watch::Sender<bool>,
+    enabled: bool,
+) {
+    // A command that says what the setting already is happens on every reconnect, when the broker
+    // replays the retained one, and isn't worth telling Home Assistant about again
+    let changed = paging.send_if_modified(|current| {
+        let changed = *current != enabled;
+        *current = enabled;
+
+        changed
+    });
+
+    if !changed {
+        return;
+    }
+
+    println!(
+        "[{serial}] Paging mode {}",
+        if enabled { "enabled" } else { "disabled" }
+    );
+
+    mqtt::publish_paging_state(mqtt_client, serial, enabled).await;
 }
 
 /// Pings devices that drop the connection when idle. Never returns for devices that don't
@@ -1144,9 +1265,22 @@ async fn set_page(
     serial: &str,
     mqtt_client: &AsyncClient,
     backlight: &Backlight,
-    pages: &Pages<'_>,
+    pages: &mut Pages<'_>,
     page: u16,
 ) -> Result<(), MirajazzError> {
+    // A page a knob turned to, coming back to us after `turn_page` published it. The knob may well
+    // have turned the page again by the time it arrives, so it is never acted on. Any of ours ahead
+    // of it never made it back, which a dropped connection does to them.
+    if let Some(at) = pages.echoes.iter().position(|&echo| echo == page) {
+        pages.echoes.drain(..=at);
+
+        return Ok(());
+    }
+
+    // Anything else is a real request. The broker had it before any of ours still on their way
+    // back, so those are the later word, and are shown when they arrive rather than skipped.
+    pages.echoes.clear();
+
     if page >= pages.count {
         println!(
             "[{serial}] Ignoring page {page}: the device has {} page(s), numbered from 0",
@@ -1163,6 +1297,44 @@ async fn set_page(
     }
 
     show_page(device, kind, serial, mqtt_client, backlight, pages, page).await
+}
+
+/// Turns the page as a knob in paging mode asks, and reports it back. A turn past the first or last
+/// page goes nowhere.
+///
+/// Turns that queued up while an earlier page was being drawn are taken together, so a knob spun
+/// quickly draws the page it lands on rather than every page along the way.
+#[allow(clippy::too_many_arguments)]
+async fn turn_page(
+    device: &Mutex<&Device>,
+    kind: Kind,
+    serial: &str,
+    mqtt_client: &AsyncClient,
+    backlight: &Backlight,
+    pages: &mut Pages<'_>,
+    turn: PageTurn,
+    turns: &mut mpsc::UnboundedReceiver<PageTurn>,
+) -> Result<(), MirajazzError> {
+    let current = *pages.current.borrow();
+    let count = pages.count;
+    let queued = std::iter::from_fn(|| turns.try_recv().ok());
+    let page = std::iter::once(turn)
+        .chain(queued)
+        .fold(current, |page, turn| turn.apply(page, count));
+
+    if page == current {
+        return Ok(());
+    }
+
+    show_page(device, kind, serial, mqtt_client, backlight, pages, page).await?;
+
+    // Home Assistant's page command is retained, and the broker hands it back every time we
+    // reconnect, so it has to say this page now or the device turns back to the old one. Our copy
+    // comes back to us like any other command, and is recognized as ours by `set_page`.
+    pages.echoes.push_back(page);
+    mqtt::publish_page_command(mqtt_client, serial, page).await;
+
+    Ok(())
 }
 
 /// Changes how many pages of buttons the device has, as Home Assistant asks, and reports it back.
@@ -1323,4 +1495,43 @@ fn report_missing_screen(serial: &str, kind: Kind, screen: Screen) {
         kind.screen_key_count(),
         kind.lcd_segment_count()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_knob_twisted_right_goes_to_the_next_page() {
+        assert_eq!(PageTurn::from_twist(1), PageTurn::Next);
+        assert_eq!(PageTurn::from_twist(-1), PageTurn::Previous);
+
+        assert_eq!(PageTurn::Next.apply(0, 3), 1);
+        assert_eq!(PageTurn::Previous.apply(2, 3), 1);
+    }
+
+    #[test]
+    fn a_turn_past_the_first_or_last_page_goes_nowhere() {
+        assert_eq!(PageTurn::Previous.apply(0, 3), 0);
+        assert_eq!(PageTurn::Next.apply(2, 3), 2);
+
+        // A device with a single page has nowhere to turn to at all
+        assert_eq!(PageTurn::Next.apply(0, 1), 0);
+        assert_eq!(PageTurn::Previous.apply(0, 1), 0);
+    }
+
+    #[test]
+    fn turns_taken_together_stop_at_the_ends_one_at_a_time() {
+        use PageTurn::{Next, Previous};
+
+        // Out of three pages, the way `turn_page` takes the turns that queued up
+        let land =
+            |from, turns: &[PageTurn]| turns.iter().fold(from, |page, turn| turn.apply(page, 3));
+
+        // Running into the last page and coming back is one back from the last page, rather than
+        // the turns cancelling out
+        assert_eq!(land(1, &[Next, Next, Next, Previous]), 1);
+        assert_eq!(land(2, &[Next, Previous]), 1);
+        assert_eq!(land(0, &[Previous, Next]), 1);
+    }
 }
