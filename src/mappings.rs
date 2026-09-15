@@ -14,6 +14,11 @@ pub const N3_PID: u16 = 0x1003;
 pub const VSDINSIDE_VID: u16 = 0x5548;
 pub const N1_PID: u16 = 0x1002;
 
+/// The most pages of buttons Home Assistant can give a device. Every page is another full set of
+/// triggers, image entities and multi-click switches, all of them retained, so this keeps a
+/// mistyped page count from flooding the broker and Home Assistant with thousands of them.
+pub const MAX_PAGES: u16 = 16;
+
 /// All devices are behind usage page 65440, usage id 1
 pub const QUERIES: &[DeviceQuery] = &[
     DeviceQuery::new(65440, 1, MIRABOX_VID, N3_PID),
@@ -33,10 +38,13 @@ pub enum Kind {
 /// Somewhere an image can be shown: the screen in a button, or one segment of the LCD strip.
 /// Which of these a device actually has depends on its [`Kind`], so a screen only becomes a
 /// hardware image id by way of [`Kind::resolve_screen`].
+///
+/// A button is identified by its id across every page (see [`Kind::button_id`]), so the same
+/// physical screen is a different `Screen` on each page. The LCD strip isn't paged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Screen {
-    Button(u8),
-    Lcd(u8),
+    Button(u16),
+    Lcd(u16),
 }
 
 impl Kind {
@@ -121,9 +129,9 @@ impl Kind {
     }
 
     /// The LCD strip segments continue the hardware image ids right after the keys
-    pub fn lcd_hw_key(&self, segment: u8) -> Option<u8> {
+    pub fn lcd_hw_key(&self, segment: u16) -> Option<u8> {
         if (segment as usize) < self.lcd_segment_count() {
-            Some(self.screen_key_count() as u8 + segment)
+            Some(self.screen_key_count() as u8 + segment as u8)
         } else {
             None
         }
@@ -143,22 +151,64 @@ impl Kind {
         }
     }
 
-    /// Every screen this model has, buttons first and then the LCD strip
-    pub fn screens(&self) -> Vec<Screen> {
-        let buttons = (0..self.screen_key_count() as u8).map(Screen::Button);
-        let lcd = (0..self.lcd_segment_count() as u8).map(Screen::Lcd);
+    /// Identifies a button across every page: the buttons on each page are numbered on from the
+    /// last one of the page before, so on a model with 17 buttons the first one of the second page
+    /// is button 17
+    pub fn button_id(&self, page: u16, key: u8) -> u16 {
+        page * self.key_count() as u16 + u16::from(key)
+    }
 
-        buttons.chain(lcd).collect()
+    /// The page a button is on, and which of the physical buttons it is there. The reverse of
+    /// [`Kind::button_id`].
+    pub fn locate_button(&self, id: u16) -> (u16, u8) {
+        let keys = self.key_count() as u16;
+
+        (id / keys, (id % keys) as u8)
+    }
+
+    /// Every button on one page, screen or not
+    pub fn page_buttons(&self, page: u16) -> impl Iterator<Item = u16> {
+        let first = self.button_id(page, 0);
+
+        first..first + self.key_count() as u16
+    }
+
+    /// The screens of the buttons on one page
+    pub fn page_screens(&self, page: u16) -> Vec<Screen> {
+        (0..self.screen_key_count() as u8)
+            .map(|key| Screen::Button(self.button_id(page, key)))
+            .collect()
+    }
+
+    /// The segments of the LCD strip, which show the same thing whichever page is up
+    pub fn lcd_screens(&self) -> Vec<Screen> {
+        (0..self.lcd_segment_count() as u16)
+            .map(Screen::Lcd)
+            .collect()
+    }
+
+    /// The page a screen belongs to, or `None` for one that is shown whichever page is up
+    pub fn screen_page(&self, screen: Screen) -> Option<u16> {
+        match screen {
+            Screen::Button(id) => Some(self.locate_button(id).0),
+            Screen::Lcd(_) => None,
+        }
     }
 
     /// The hardware image id and image format to use for a screen, or `None` when this model
-    /// doesn't have that screen
+    /// doesn't have that screen. A button screen on any page up to [`MAX_PAGES`] resolves to the
+    /// physical screen it is shown on, whether or not that page is showing or even exists yet.
     pub fn resolve_screen(&self, screen: Screen) -> Option<(u8, ImageFormat)> {
         match screen {
-            Screen::Button(id) if (id as usize) < self.screen_key_count() => {
-                Some((id, self.image_format()))
+            Screen::Button(id) => {
+                let (page, key) = self.locate_button(id);
+
+                if page < MAX_PAGES && (key as usize) < self.screen_key_count() {
+                    Some((key, self.image_format()))
+                } else {
+                    None
+                }
             }
-            Screen::Button(_) => None,
             Screen::Lcd(id) => self
                 .lcd_hw_key(id)
                 .map(|key| (key, self.lcd_image_format())),
@@ -189,12 +239,21 @@ impl Kind {
         }
     }
 
-    /// Human readable button name, used as the subtype of the Home Assistant trigger
-    pub fn button_label(&self, id: u8) -> String {
-        match (self, id) {
-            (Kind::VsdInsideN1, 15) => "Top button left".to_string(),
-            (Kind::VsdInsideN1, 16) => "Top button right".to_string(),
-            _ => format!("Button {id}"),
+    /// Human readable button name, used as the subtype of the Home Assistant trigger. Buttons with
+    /// a name of their own say which page they are on past the first, since the name is the same on
+    /// every page.
+    pub fn button_label(&self, id: u16) -> String {
+        let (page, key) = self.locate_button(id);
+
+        let name = match (self, key) {
+            (Kind::VsdInsideN1, 15) => "Top button left",
+            (Kind::VsdInsideN1, 16) => "Top button right",
+            _ => return format!("Button {id}"),
+        };
+
+        match page {
+            0 => name.to_string(),
+            _ => format!("{name} (page {page})"),
         }
     }
 
@@ -254,18 +313,55 @@ mod tests {
     }
 
     #[test]
-    fn screens_are_listed_buttons_first() {
+    fn screens_are_listed_per_page() {
         assert_eq!(
-            Kind::MiraboxN3.screens(),
+            Kind::MiraboxN3.page_screens(0),
             (0..6).map(Screen::Button).collect::<Vec<_>>()
         );
+        // The N3's second page starts after all nine of its buttons, not just the six screens
+        assert_eq!(
+            Kind::MiraboxN3.page_screens(1),
+            (9..15).map(Screen::Button).collect::<Vec<_>>()
+        );
 
-        let n1 = Kind::VsdInsideN1.screens();
-        assert_eq!(n1.len(), 18);
-        assert_eq!(n1[0], Screen::Button(0));
-        assert_eq!(n1[14], Screen::Button(14));
-        assert_eq!(n1[15], Screen::Lcd(0));
-        assert_eq!(n1[17], Screen::Lcd(2));
+        let n1 = Kind::VsdInsideN1.page_screens(1);
+        assert_eq!(n1.len(), 15);
+        assert_eq!(n1[0], Screen::Button(17));
+        assert_eq!(n1[14], Screen::Button(31));
+
+        assert_eq!(
+            Kind::VsdInsideN1.lcd_screens(),
+            vec![Screen::Lcd(0), Screen::Lcd(1), Screen::Lcd(2)]
+        );
+        assert!(Kind::MiraboxN3.lcd_screens().is_empty());
+    }
+
+    #[test]
+    fn buttons_are_numbered_on_across_pages() {
+        let n1 = Kind::VsdInsideN1;
+
+        assert_eq!(n1.button_id(0, 16), 16);
+        assert_eq!(n1.button_id(1, 0), 17);
+        assert_eq!(n1.button_id(2, 3), 37);
+
+        for id in [0, 16, 17, 37, 271] {
+            let (page, key) = n1.locate_button(id);
+            assert_eq!(n1.button_id(page, key), id);
+        }
+
+        assert_eq!(
+            n1.page_buttons(1).collect::<Vec<_>>(),
+            (17..34).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn named_buttons_say_which_page_they_are_on() {
+        let n1 = Kind::VsdInsideN1;
+
+        assert_eq!(n1.button_label(15), "Top button left");
+        assert_eq!(n1.button_label(17 + 16), "Top button right (page 1)");
+        assert_eq!(n1.button_label(17), "Button 17");
     }
 
     #[test]
@@ -276,17 +372,28 @@ mod tests {
         assert_eq!(hw_key(Kind::VsdInsideN1, Screen::Button(14)), Some(14));
         assert_eq!(hw_key(Kind::VsdInsideN1, Screen::Lcd(0)), Some(15));
 
-        // Buttons 15 and 16 exist on the N1 but have no screen of their own
+        // Buttons on later pages are shown on the same physical screens
+        assert_eq!(hw_key(Kind::VsdInsideN1, Screen::Button(17 + 14)), Some(14));
+        assert_eq!(hw_key(Kind::MiraboxN3, Screen::Button(9)), Some(0));
+
+        // Buttons 15 and 16 exist on the N1 but have no screen of their own, on any page
         assert_eq!(hw_key(Kind::VsdInsideN1, Screen::Button(15)), None);
-        // And the N3 has neither that many buttons nor an LCD strip
+        assert_eq!(hw_key(Kind::VsdInsideN1, Screen::Button(17 + 15)), None);
+        // And the N3 has neither that many screens per page nor an LCD strip
         assert_eq!(hw_key(Kind::MiraboxN3, Screen::Button(6)), None);
         assert_eq!(hw_key(Kind::MiraboxN3, Screen::Lcd(0)), None);
+
+        // Nor is there a page past the last one there can be
+        let past_the_end = Kind::MiraboxN3.button_id(MAX_PAGES, 0);
+        assert_eq!(hw_key(Kind::MiraboxN3, Screen::Button(past_the_end)), None);
     }
 
     #[test]
     fn every_screen_a_model_lists_can_be_resolved() {
         for kind in [Kind::MiraboxN3, Kind::VsdInsideN1] {
-            for screen in kind.screens() {
+            let pages = (0..MAX_PAGES).flat_map(|page| kind.page_screens(page));
+
+            for screen in pages.chain(kind.lcd_screens()) {
                 assert!(
                     kind.resolve_screen(screen).is_some(),
                     "{kind:?} lists {screen} but cannot resolve it"

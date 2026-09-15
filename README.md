@@ -53,7 +53,7 @@ id = 0 # segment of the LCD strip, left to right
 icon = "clock.png"
 ```
 
-All images referenced in the config should be placed in the `images/` directory. Entries for buttons or LCD segments the connected device doesn't have (for example `id = 8` on a device whose screens stop at button 5) are skipped with a warning, so the same config file can be used with either model. An icon that can't be read leaves that button blank, it doesn't stop the device.
+All images referenced in the config should be placed in the `images/` directory. A button `id` can be one on a later [page](#pages-of-buttons) too, such as `id = 17` for the first button of the N1's second page; it is shown once Home Assistant gives the device that page. Entries for buttons or LCD segments the connected device doesn't have (for example `id = 8` on a device whose screens stop at button 5) are skipped with a warning, so the same config file can be used with either model. An icon that can't be read leaves that button blank, it doesn't stop the device.
 
 ### Giving one device its own settings
 
@@ -223,6 +223,44 @@ While the switch is on, the device also gets "double", "triple", "quadruple" and
 
 It takes the same payloads as the [screen timeout](#switching-it-from-an-automation), and like the timeout it survives a restart of either side when published with `retain: true`, which the switch does for you.
 
+## Pages of buttons
+
+A device can have more than one page of buttons, with only one of them showing at a time. Each device gets a "Page count" number and a "Page" number, listed under Configuration on the device page next to the other settings. A device starts with a single page; raising "Page count" (up to 16) adds pages, and "Page" picks which one the device shows, counting from 0.
+
+Every page is a full set of buttons with ids of their own: the buttons of each page are numbered on from the last button of the page before. On the N1, which has 17 buttons (ids 0-16), the first page is buttons 0-16, the second is 17-33, and so on; on the N3, with 9 buttons, the second page is 9-17. So a button is always `page * button_count + button_index`, and pressing the top-left button of the N1 while its second page is up reports `button_17_press`.
+
+Everything that belongs to a button belongs to it on its page: its trigger, its image entity ("Button 17 image"), and its multi-click switch. They are added to Home Assistant when a page is added and removed again when it is taken away. The LCD strip and the knobs aren't paged, they are the same whichever page is up.
+
+Switching pages redraws every button screen with what that page has on it, and lights the screens if they had dimmed. Images for a page that isn't showing can be set at any time; they are kept and drawn when that page comes up, and a page that is taken away and added again comes back as it was. A press is reported as the button on the page that was up when it went down, so a button that switches pages still reports its release (and counts its presses) as the button it was pressed as.
+
+### Switching pages from an automation
+
+| Topic | What it does |
+| --- | --- |
+| `streamdock/<serial>/page_count/set` | Gives the device this many pages, 1-16 |
+| `streamdock/<serial>/page_count` | Reports how many pages it has (published by the app, don't write to it) |
+| `streamdock/<serial>/page/set` | Shows this page, counting from 0 |
+| `streamdock/<serial>/page` | Reports the page that is showing (published by the app, don't write to it) |
+
+A knob or button that flips through the pages is a short automation:
+
+```yaml
+triggers:
+  - trigger: mqtt
+    topic: streamdock/AL12345678/trigger
+    payload: knob_0_right
+actions:
+  - action: mqtt.publish
+    data:
+      topic: streamdock/AL12345678/page/set
+      retain: true
+      payload: "{{ (states('number.stream_dock_al12345678_page') | int + 1) % (states('number.stream_dock_al12345678_page_count') | int) }}"
+```
+
+Both take whole numbers, like the [brightness](#setting-it-from-an-automation). A page the device doesn't have is logged and ignored, and a device showing a page that is taken away moves to the last page it still has. Publish with `retain: true` (which the numbers do for you) and both survive a restart of either side.
+
+The [blueprints](#setting-up-automations-in-home-assistant) only have actions for the first page. Buttons on later pages have device triggers of their own, or can be matched with an MQTT trigger on their payload.
+
 ## Setting up automations in Home Assistant
 
 Once the app is running and connected to your MQTT broker, it publishes discovery data and a new device named "Stream Dock (...)" appears under Settings -> Devices & Services -> MQTT. From there you can build one "Device" automation per button/knob trigger (Settings -> Automations -> Add Automation -> When -> Device -> select the Stream Dock device -> pick a trigger such as "Button 1 pressed" or "Knob 0 rotated left/right").
@@ -249,6 +287,7 @@ Which means `vendor_id = 0x6603` and `product_id = 0x1003`. If the device is rec
 
 - Register buttons and knobs as Home Assistant MQTT device triggers, so actions are defined via HA automations
 - Tell double, triple and longer presses of a button apart, turned on per button from Home Assistant
+- Give a device several pages of buttons, each with its own triggers and images, and switch between them from Home Assistant
 - Support for multiple device models, detected automatically by USB ID
 - Run several devices at once, each with its own HA device and optionally its own settings
 - Pick up devices as they are plugged in and drop them as they are unplugged, without a restart

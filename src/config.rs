@@ -17,7 +17,8 @@ pub struct Config {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ImageConfig {
-    pub id: u8,
+    /// For buttons, the id across every page, so one on a later page can start out with an icon
+    pub id: u16,
     pub icon: String,
 }
 
@@ -95,7 +96,7 @@ mod tests {
         config
     }
 
-    fn icons(images: &[ImageConfig]) -> Vec<(u8, &str)> {
+    fn icons(images: &[ImageConfig]) -> Vec<(u16, &str)> {
         images.iter().map(|i| (i.id, i.icon.as_str())).collect()
     }
 

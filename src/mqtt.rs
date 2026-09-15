@@ -1,12 +1,17 @@
 use dotenv::dotenv;
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, Publish, QoS};
 use serde_json::json;
-use std::{collections::HashSet, env::var, time::Duration};
+use std::{
+    collections::HashSet,
+    env::var,
+    ops::{Range, RangeInclusive},
+    time::Duration,
+};
 use tokio::{sync::broadcast, task::JoinHandle};
 
 use crate::{
     icons::Shortened,
-    mappings::{Kind, Screen},
+    mappings::{Kind, MAX_PAGES, Screen},
 };
 
 /// Root of every topic this app uses, both the ones it publishes and the ones it listens on
@@ -19,9 +24,10 @@ const TOPIC_ROOT: &str = "streamdock";
 const MAX_PACKET_SIZE: usize = 512 * 1024;
 
 /// How many events can be waiting for the devices to pick them up. Every connected device gets
-/// its own retained image for every screen at once when it subscribes, so this has room for a
-/// few devices' worth; a device that still falls behind skips the messages it missed.
-const EVENT_CAPACITY: usize = 64;
+/// its own retained image and multi-click setting for every button on every page at once when it
+/// subscribes, so this has room for a device with every page in use; a device that still falls
+/// behind skips the messages it missed.
+const EVENT_CAPACITY: usize = 512;
 
 /// How long to wait before reconnecting after the MQTT connection fails
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -34,6 +40,12 @@ const BRIGHTNESS_OBJECT_ID: &str = "brightness";
 
 /// The device takes its brightness as a percentage, so this is the top of the range
 const MAX_BRIGHTNESS: u8 = 100;
+
+/// Identifies the entity for the page a device is showing within its device
+const PAGE_OBJECT_ID: &str = "page";
+
+/// Identifies the entity for how many pages a device has within its device
+const PAGE_COUNT_OBJECT_ID: &str = "page_count";
 
 /// What Home Assistant's switch sends and expects by default, and what this app reports
 const PAYLOAD_ON: &str = "ON";
@@ -61,7 +73,11 @@ pub enum Command<'a> {
     Brightness(u8),
     /// Count a button's presses in quick succession and report them together, or report every
     /// press the moment the button goes down
-    MultiClick(u8, bool),
+    MultiClick(u16, bool),
+    /// Show this page of buttons, counting from 0
+    Page(u16),
+    /// Give the device this many pages of buttons
+    PageCount(u16),
 }
 
 /// Something that happened on the MQTT connection and that the devices need to know about
@@ -173,13 +189,33 @@ fn brightness_command_topic(device_id: &str) -> String {
 }
 
 /// Where it is reported whether a button counts its presses
-fn multi_click_topic(device_id: &str, id: u8) -> String {
+fn multi_click_topic(device_id: &str, id: u16) -> String {
     format!("{TOPIC_ROOT}/{device_id}/button/{id}/multi_click")
 }
 
 /// Where a button's multi-click mode is turned on and off
-fn multi_click_command_topic(device_id: &str, id: u8) -> String {
+fn multi_click_command_topic(device_id: &str, id: u16) -> String {
     format!("{}/set", multi_click_topic(device_id, id))
+}
+
+/// Where the page of buttons a device is showing is reported
+fn page_topic(device_id: &str) -> String {
+    format!("{TOPIC_ROOT}/{device_id}/page")
+}
+
+/// Where the page to show is sent
+fn page_command_topic(device_id: &str) -> String {
+    format!("{}/set", page_topic(device_id))
+}
+
+/// Where how many pages of buttons a device has is reported
+fn page_count_topic(device_id: &str) -> String {
+    format!("{TOPIC_ROOT}/{device_id}/page_count")
+}
+
+/// Where a new number of pages is sent
+fn page_count_command_topic(device_id: &str) -> String {
+    format!("{}/set", page_count_topic(device_id))
 }
 
 /// Identifies a screen's entity within its device
@@ -192,7 +228,7 @@ fn image_object_id(screen: Screen) -> String {
 
 /// What is published on the trigger topic when a button is pressed this many times in a row. A
 /// single press keeps the name it had before buttons could count their presses.
-fn button_press_payload(id: u8, presses: u32) -> String {
+fn button_press_payload(id: u16, presses: u32) -> String {
     match presses {
         1 => format!("button_{id}_press"),
         _ => format!("button_{id}_press_{presses}"),
@@ -209,38 +245,22 @@ fn device_info(device_id: &str, kind: Kind) -> serde_json::Value {
     })
 }
 
-// Publishes retained HA MQTT discovery configs for one device: a device-automation trigger per
-// button and three (rotate_left/rotate_right/press) per knob, a text entity per screen to set the
-// image it shows, a switch per button for its multi-click mode, a switch for the screen timeout and
-// a number for the screen brightness. How many of each there are depends on the model of the device.
+// Publishes retained HA MQTT discovery configs for one device: three triggers
+// (rotate_left/rotate_right/press) per knob, a text entity per LCD segment to set the image it
+// shows, a switch for the screen timeout, a number for the screen brightness, and numbers for how
+// many pages of buttons there are and which one is showing. Then, for each of those pages,
+// everything `publish_page_discovery` publishes for its buttons. How many of each there are
+// depends on the model of the device.
 //
 // The triggers for pressing a button several times in a row come and go with its multi-click mode,
 // so they are published along with its state instead, by `publish_multi_click_states`.
-pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind) {
+pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind, pages: u16) {
     let prefix = discovery_prefix();
     let topic = trigger_topic(device_id);
     let device = device_info(device_id, kind);
 
-    for id in 0..kind.key_count() as u8 {
-        let payload = json!({
-            "automation_type": "trigger",
-            "platform": "device_automation",
-            "topic": topic,
-            "type": "button_short_press",
-            "subtype": kind.button_label(id),
-            "payload": button_press_payload(id, 1),
-            "device": device,
-        });
-
-        publish_discovery_config(
-            client,
-            &prefix,
-            "device_automation",
-            device_id,
-            &format!("button_{id}"),
-            &payload,
-        )
-        .await;
+    for page in 0..pages {
+        publish_page_discovery(client, device_id, kind, page).await;
     }
 
     for id in 0..kind.encoder_count() as u8 {
@@ -272,41 +292,8 @@ pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind
         }
     }
 
-    for screen in kind.screens() {
-        let object_id = image_object_id(screen);
-        // `retain` is what Home Assistant uses when it publishes to the command topic. Keeping
-        // the command retained is what brings the screens back after either side restarts.
-        let payload = json!({
-            "name": format!("{screen} image"),
-            "unique_id": format!("{TOPIC_ROOT}_{device_id}_{object_id}"),
-            "command_topic": image_command_topic(device_id, screen),
-            "state_topic": image_topic(device_id, screen),
-            "retain": true,
-            "entity_category": "config",
-            "icon": "mdi:image",
-            "device": device,
-        });
-
-        publish_discovery_config(client, &prefix, "text", device_id, &object_id, &payload).await;
-    }
-
-    // Retained like the images, so a button keeps counting its presses after either side restarts
-    for id in 0..kind.key_count() as u8 {
-        let object_id = format!("button_{id}_multi_click");
-        let payload = json!({
-            "name": format!("{} multi-click", kind.button_label(id)),
-            "unique_id": format!("{TOPIC_ROOT}_{device_id}_{object_id}"),
-            "command_topic": multi_click_command_topic(device_id, id),
-            "state_topic": multi_click_topic(device_id, id),
-            "payload_on": PAYLOAD_ON,
-            "payload_off": PAYLOAD_OFF,
-            "retain": true,
-            "entity_category": "config",
-            "icon": "mdi:gesture-double-tap",
-            "device": device,
-        });
-
-        publish_discovery_config(client, &prefix, "switch", device_id, &object_id, &payload).await;
+    for screen in kind.lcd_screens() {
+        publish_image_discovery(client, &prefix, device_id, &device, screen).await;
     }
 
     // Retained for the same reason the images are: it is the retained command that brings the
@@ -361,6 +348,174 @@ pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind
         &payload,
     )
     .await;
+
+    // Retained like the rest, and it is the retained command that brings the extra pages back
+    let payload = json!({
+        "name": "Page count",
+        "unique_id": format!("{TOPIC_ROOT}_{device_id}_{PAGE_COUNT_OBJECT_ID}"),
+        "command_topic": page_count_command_topic(device_id),
+        "state_topic": page_count_topic(device_id),
+        "min": 1,
+        "max": MAX_PAGES,
+        "step": 1,
+        "mode": "box",
+        "retain": true,
+        "entity_category": "config",
+        "icon": "mdi:book-multiple-outline",
+        "device": device,
+    });
+
+    publish_discovery_config(
+        client,
+        &prefix,
+        "number",
+        device_id,
+        PAGE_COUNT_OBJECT_ID,
+        &payload,
+    )
+    .await;
+
+    publish_page_number_discovery(client, device_id, kind, pages).await;
+}
+
+/// Publishes the discovery config for the number that picks the page a device shows. Its range
+/// follows how many pages there are, so it is published again every time that changes.
+pub async fn publish_page_number_discovery(
+    client: &AsyncClient,
+    device_id: &str,
+    kind: Kind,
+    pages: u16,
+) {
+    // Retained, so the device comes back on the page it was showing rather than the first one
+    let payload = json!({
+        "name": "Page",
+        "unique_id": format!("{TOPIC_ROOT}_{device_id}_{PAGE_OBJECT_ID}"),
+        "command_topic": page_command_topic(device_id),
+        "state_topic": page_topic(device_id),
+        "min": 0,
+        "max": pages.saturating_sub(1),
+        "step": 1,
+        "mode": "box",
+        "retain": true,
+        "entity_category": "config",
+        "icon": "mdi:book-open-page-variant-outline",
+        "device": device_info(device_id, kind),
+    });
+
+    publish_discovery_config(
+        client,
+        &discovery_prefix(),
+        "number",
+        device_id,
+        PAGE_OBJECT_ID,
+        &payload,
+    )
+    .await;
+}
+
+/// Publishes the discovery configs for the buttons on one page: a device-automation trigger per
+/// button, a text entity per button screen to set the image it shows, and a switch per button for
+/// its multi-click mode
+pub async fn publish_page_discovery(client: &AsyncClient, device_id: &str, kind: Kind, page: u16) {
+    let prefix = discovery_prefix();
+    let topic = trigger_topic(device_id);
+    let device = device_info(device_id, kind);
+
+    for id in kind.page_buttons(page) {
+        let payload = json!({
+            "automation_type": "trigger",
+            "platform": "device_automation",
+            "topic": topic,
+            "type": "button_short_press",
+            "subtype": kind.button_label(id),
+            "payload": button_press_payload(id, 1),
+            "device": device,
+        });
+
+        publish_discovery_config(
+            client,
+            &prefix,
+            "device_automation",
+            device_id,
+            &format!("button_{id}"),
+            &payload,
+        )
+        .await;
+    }
+
+    for screen in kind.page_screens(page) {
+        publish_image_discovery(client, &prefix, device_id, &device, screen).await;
+    }
+
+    // Retained like the images, so a button keeps counting its presses after either side restarts
+    for id in kind.page_buttons(page) {
+        let object_id = format!("button_{id}_multi_click");
+        let payload = json!({
+            "name": format!("{} multi-click", kind.button_label(id)),
+            "unique_id": format!("{TOPIC_ROOT}_{device_id}_{object_id}"),
+            "command_topic": multi_click_command_topic(device_id, id),
+            "state_topic": multi_click_topic(device_id, id),
+            "payload_on": PAYLOAD_ON,
+            "payload_off": PAYLOAD_OFF,
+            "retain": true,
+            "entity_category": "config",
+            "icon": "mdi:gesture-double-tap",
+            "device": device,
+        });
+
+        publish_discovery_config(client, &prefix, "switch", device_id, &object_id, &payload).await;
+    }
+}
+
+/// Takes back everything `publish_page_discovery` and `publish_multi_click_state` published for
+/// the buttons on one page, once the device no longer has that page
+pub async fn remove_page_discovery(client: &AsyncClient, device_id: &str, kind: Kind, page: u16) {
+    let prefix = discovery_prefix();
+
+    for id in kind.page_buttons(page) {
+        let triggers = std::iter::once(format!("button_{id}")).chain(
+            MULTI_PRESS_TYPES
+                .iter()
+                .map(|(presses, _)| format!("button_{id}_press_{presses}")),
+        );
+
+        for object_id in triggers {
+            remove_discovery_config(client, &prefix, "device_automation", device_id, &object_id)
+                .await;
+        }
+
+        let object_id = format!("button_{id}_multi_click");
+        remove_discovery_config(client, &prefix, "switch", device_id, &object_id).await;
+    }
+
+    for screen in kind.page_screens(page) {
+        remove_discovery_config(client, &prefix, "text", device_id, &image_object_id(screen)).await;
+    }
+}
+
+/// Publishes the text entity that sets the image one screen shows
+async fn publish_image_discovery(
+    client: &AsyncClient,
+    prefix: &str,
+    device_id: &str,
+    device: &serde_json::Value,
+    screen: Screen,
+) {
+    let object_id = image_object_id(screen);
+    // `retain` is what Home Assistant uses when it publishes to the command topic. Keeping
+    // the command retained is what brings the screens back after either side restarts.
+    let payload = json!({
+        "name": format!("{screen} image"),
+        "unique_id": format!("{TOPIC_ROOT}_{device_id}_{object_id}"),
+        "command_topic": image_command_topic(device_id, screen),
+        "state_topic": image_topic(device_id, screen),
+        "retain": true,
+        "entity_category": "config",
+        "icon": "mdi:image",
+        "device": device,
+    });
+
+    publish_discovery_config(client, prefix, "text", device_id, &object_id, &payload).await;
 }
 
 async fn publish_discovery_config(
@@ -394,16 +549,23 @@ async fn remove_discovery_config(
         .unwrap_or_else(|_| println!("Failed to remove discovery config for {object_id}"));
 }
 
-/// Asks for the commands addressed to one device: the images for its screens, which of its buttons
-/// count their presses, the state of its screen timeout and the brightness its screens are lit at.
+/// Asks for the commands addressed to one device: how many pages of buttons it has and which one
+/// it shows, the images for its screens, which of its buttons count their presses, the state of its
+/// screen timeout and the brightness its screens are lit at.
 ///
 /// This has to be repeated on every new connection, because an MQTT session starts with no
 /// subscriptions. The broker replays the retained commands each time, which is what restores the
 /// screens and the settings after this app restarts or the connection drops.
 pub async fn subscribe_commands(client: &AsyncClient, device_id: &str) {
+    // Brokers replay the retained messages for each subscription as they take it on, so asking for
+    // the page count first is what has it arrive before the page, which is only accepted when that
+    // page exists.
+    //
     // One filter covers every screen: the image commands only differ in the button/lcd path. And
     // one covers every button's multi-click mode, which only differ in the button id.
     let filters = [
+        page_count_command_topic(device_id),
+        page_command_topic(device_id),
         format!("{TOPIC_ROOT}/{device_id}/+/+/image/set"),
         format!("{TOPIC_ROOT}/{device_id}/button/+/multi_click/set"),
         timeout_command_topic(device_id),
@@ -441,6 +603,15 @@ fn parse_command<'a>(topic: &str, payload: &'a [u8], device_id: &str) -> Option<
         return parse_brightness(payload, device_id).map(Command::Brightness);
     }
 
+    if topic == page_command_topic(device_id) {
+        return parse_number(payload, device_id, "page", 0..=MAX_PAGES - 1).map(Command::Page);
+    }
+
+    if topic == page_count_command_topic(device_id) {
+        return parse_number(payload, device_id, "page count", 1..=MAX_PAGES)
+            .map(Command::PageCount);
+    }
+
     None
 }
 
@@ -471,14 +642,30 @@ fn parse_switch(payload: &[u8], device_id: &str, what: &str) -> Option<bool> {
     }
 }
 
-/// Reads a brightness percentage. Home Assistant's number entity sends whole numbers, but a
-/// template can just as easily produce `40.0`, so both are read. An empty payload is a retained
-/// command being cleared rather than a setting, so it says nothing about how bright to be, and a
-/// level the screens can't be lit at is reported rather than quietly clamped, so a payload in the
-/// wrong units doesn't silently darken the device.
+/// Reads a brightness percentage. A level the screens can't be lit at is reported rather than
+/// quietly clamped, so a payload in the wrong units doesn't silently darken the device.
 fn parse_brightness(payload: &[u8], device_id: &str) -> Option<u8> {
+    parse_number(
+        payload,
+        device_id,
+        "screen brightness",
+        0..=u16::from(MAX_BRIGHTNESS),
+    )
+    .map(|percent| percent as u8)
+}
+
+/// Reads a whole number for the setting named by `what`. Home Assistant's number entity sends whole
+/// numbers, but a template can just as easily produce `40.0`, so both are read. An empty payload is
+/// a retained command being cleared rather than a setting, so it says nothing about what the setting
+/// should be, and a number outside `range` is reported rather than clamped to it.
+fn parse_number(
+    payload: &[u8],
+    device_id: &str,
+    what: &str,
+    range: RangeInclusive<u16>,
+) -> Option<u16> {
     let Ok(text) = str::from_utf8(payload) else {
-        println!("[{device_id}] Ignoring a screen brightness command that isn't text");
+        println!("[{device_id}] Ignoring a {what} command that isn't text");
 
         return None;
     };
@@ -489,23 +676,24 @@ fn parse_brightness(payload: &[u8], device_id: &str) -> Option<u8> {
         return None;
     }
 
-    let percent = command
+    let number = command
         .parse::<f64>()
         .ok()
         .map(f64::round)
-        .filter(|percent| (0.0..=f64::from(MAX_BRIGHTNESS)).contains(percent));
+        .filter(|number| (f64::from(*range.start())..=f64::from(*range.end())).contains(number));
 
-    let Some(percent) = percent else {
+    let Some(number) = number else {
         println!(
-            "[{device_id}] Ignoring screen brightness command '{}', expected a number from 0 to \
-             {MAX_BRIGHTNESS}",
-            Shortened(command)
+            "[{device_id}] Ignoring {what} command '{}', expected a number from {} to {}",
+            Shortened(command),
+            range.start(),
+            range.end()
         );
 
         return None;
     };
 
-    Some(percent as u8)
+    Some(number as u16)
 }
 
 fn parse_image_command(topic: &str, device_id: &str) -> Option<Screen> {
@@ -527,7 +715,7 @@ fn parse_image_command(topic: &str, device_id: &str) -> Option<Screen> {
 }
 
 /// Picks out which button a multi-click command is for
-fn parse_multi_click_command(topic: &str, device_id: &str) -> Option<u8> {
+fn parse_multi_click_command(topic: &str, device_id: &str) -> Option<u16> {
     topic
         .strip_prefix(TOPIC_ROOT)?
         .strip_prefix('/')?
@@ -589,8 +777,36 @@ pub async fn publish_brightness_state(client: &AsyncClient, device_id: &str, per
         });
 }
 
-/// Reports whether each of a device's buttons counts its presses, so the Home Assistant switches
-/// match the device. Retained, like the other settings.
+/// Reports which page of buttons a device is showing, so the Home Assistant number matches the
+/// device. Retained, like the other settings.
+pub async fn publish_page_state(client: &AsyncClient, device_id: &str, page: u16) {
+    client
+        .publish(
+            page_topic(device_id),
+            QoS::AtLeastOnce,
+            true,
+            page.to_string(),
+        )
+        .await
+        .unwrap_or_else(|_| println!("[{device_id}] Failed to publish the page state"));
+}
+
+/// Reports how many pages of buttons a device has, so the Home Assistant number matches the device.
+/// Retained, like the other settings.
+pub async fn publish_page_count_state(client: &AsyncClient, device_id: &str, pages: u16) {
+    client
+        .publish(
+            page_count_topic(device_id),
+            QoS::AtLeastOnce,
+            true,
+            pages.to_string(),
+        )
+        .await
+        .unwrap_or_else(|_| println!("[{device_id}] Failed to publish the page count state"));
+}
+
+/// Reports whether each of the buttons on some of a device's pages counts its presses, so the Home
+/// Assistant switches match the device. Retained, like the other settings.
 ///
 /// Also publishes the triggers for pressing a button several times in a row for the buttons that
 /// count their presses, and takes them back for the ones that don't, so a device only offers the
@@ -599,9 +815,10 @@ pub async fn publish_multi_click_states(
     client: &AsyncClient,
     device_id: &str,
     kind: Kind,
-    enabled: &HashSet<u8>,
+    pages: Range<u16>,
+    enabled: &HashSet<u16>,
 ) {
-    for id in 0..kind.key_count() as u8 {
+    for id in pages.flat_map(|page| kind.page_buttons(page)) {
         publish_multi_click_state(client, device_id, kind, id, enabled.contains(&id)).await;
     }
 }
@@ -612,7 +829,7 @@ pub async fn publish_multi_click_state(
     client: &AsyncClient,
     device_id: &str,
     kind: Kind,
-    id: u8,
+    id: u16,
     enabled: bool,
 ) {
     let state = if enabled { PAYLOAD_ON } else { PAYLOAD_OFF };
@@ -667,7 +884,7 @@ pub async fn publish_multi_click_state(
 
 /// Reports a button being pressed this many times in a row, which is always once for a button
 /// that doesn't count its presses
-pub async fn handle_button(client: &AsyncClient, device_id: &str, i: u8, presses: u32) {
+pub async fn handle_button(client: &AsyncClient, device_id: &str, i: u16, presses: u32) {
     publish_trigger(client, device_id, &button_press_payload(i, presses)).await;
 }
 
@@ -693,9 +910,17 @@ mod tests {
 
     const SERIAL: &str = "AL12345678";
 
+    /// Every screen of the N1 on its first two pages, and its LCD strip
+    fn some_screens() -> Vec<Screen> {
+        let kind = Kind::VsdInsideN1;
+        let buttons = (0..2).flat_map(|page| kind.page_screens(page));
+
+        buttons.chain(kind.lcd_screens()).collect()
+    }
+
     #[test]
     fn a_command_topic_names_the_screen_it_addresses() {
-        for screen in Kind::VsdInsideN1.screens() {
+        for screen in some_screens() {
             let topic = image_command_topic(SERIAL, screen);
 
             assert_eq!(
@@ -710,7 +935,7 @@ mod tests {
     fn the_subscription_filter_matches_every_screens_command_topic() {
         // MQTT `+` matches exactly one level, so this only holds while every screen's topic has
         // the same shape
-        for screen in Kind::VsdInsideN1.screens() {
+        for screen in some_screens() {
             let topic = image_command_topic(SERIAL, screen);
             let levels: Vec<_> = topic.split('/').collect();
 
@@ -775,7 +1000,8 @@ mod tests {
 
     #[test]
     fn a_multi_click_command_names_the_button_it_addresses() {
-        for id in [0, 8, 16] {
+        // Including buttons past the first page
+        for id in [0, 8, 16, 17, 271] {
             let topic = multi_click_command_topic(SERIAL, id);
 
             assert_eq!(
@@ -810,7 +1036,7 @@ mod tests {
             &format!("{TOPIC_ROOT}/{SERIAL}/lcd/0/multi_click/set"),
             // A button id that isn't a number, or doesn't fit one
             &format!("{TOPIC_ROOT}/{SERIAL}/button/left/multi_click/set"),
-            &format!("{TOPIC_ROOT}/{SERIAL}/button/300/multi_click/set"),
+            &format!("{TOPIC_ROOT}/{SERIAL}/button/70000/multi_click/set"),
             // A serial that merely starts with ours
             &format!("{TOPIC_ROOT}/{SERIAL}9/button/0/multi_click/set"),
         ] {
@@ -895,6 +1121,61 @@ mod tests {
     }
 
     #[test]
+    fn page_commands_are_told_apart_from_each_other_and_the_rest() {
+        assert_eq!(
+            parse_command(&page_command_topic(SERIAL), b"2", SERIAL),
+            Some(Command::Page(2))
+        );
+        assert_eq!(
+            parse_command(&page_count_command_topic(SERIAL), b"3", SERIAL),
+            Some(Command::PageCount(3))
+        );
+
+        for topic in [page_command_topic(SERIAL), page_count_command_topic(SERIAL)] {
+            assert_eq!(parse_image_command(&topic, SERIAL), None);
+            assert_eq!(parse_multi_click_command(&topic, SERIAL), None);
+        }
+
+        // Nor are the states they report, or another device's commands
+        assert_eq!(parse_command(&page_topic(SERIAL), b"2", SERIAL), None);
+        assert_eq!(parse_command(&page_count_topic(SERIAL), b"3", SERIAL), None);
+        assert_eq!(
+            parse_command(&page_command_topic("CL87654321"), b"2", SERIAL),
+            None
+        );
+    }
+
+    #[test]
+    fn pages_are_counted_from_zero_and_there_is_at_least_one() {
+        let page = page_command_topic(SERIAL);
+        let count = page_count_command_topic(SERIAL);
+
+        // A template's decimal is read like the brightness's
+        assert_eq!(
+            parse_command(&page, b" 1.0\n", SERIAL),
+            Some(Command::Page(1))
+        );
+        assert_eq!(parse_command(&page, b"0", SERIAL), Some(Command::Page(0)));
+        assert_eq!(
+            parse_command(&count, MAX_PAGES.to_string().as_bytes(), SERIAL),
+            Some(Command::PageCount(MAX_PAGES))
+        );
+
+        for payload in [
+            MAX_PAGES.to_string(),
+            "-1".to_string(),
+            "".to_string(),
+            "next".to_string(),
+        ] {
+            assert_eq!(parse_command(&page, payload.as_bytes(), SERIAL), None);
+        }
+
+        for payload in ["0", "", "-1", &(MAX_PAGES + 1).to_string()] {
+            assert_eq!(parse_command(&count, payload.as_bytes(), SERIAL), None);
+        }
+    }
+
+    #[test]
     fn a_brightness_command_for_another_device_is_not_ours() {
         let topic = brightness_command_topic("CL87654321");
 
@@ -943,7 +1224,7 @@ mod tests {
             &format!("{TOPIC_ROOT}/{SERIAL}/dial/0/image/set"),
             // A screen id that isn't a number, or doesn't fit one
             &format!("{TOPIC_ROOT}/{SERIAL}/button/left/image/set"),
-            &format!("{TOPIC_ROOT}/{SERIAL}/button/300/image/set"),
+            &format!("{TOPIC_ROOT}/{SERIAL}/button/70000/image/set"),
             // Missing the screen id altogether
             &format!("{TOPIC_ROOT}/{SERIAL}/button/image/set"),
             // A serial that merely starts with ours

@@ -1,8 +1,9 @@
+use image::{DynamicImage, imageops::FilterType};
 use mirajazz::{
     device::Device,
     error::MirajazzError,
     state::{DeviceStateReader, DeviceStateUpdate},
-    types::HidDeviceInfo,
+    types::{HidDeviceInfo, ImageFormat},
 };
 use rumqttc::AsyncClient;
 use std::{
@@ -15,7 +16,7 @@ use tokio::sync::{Mutex, broadcast, watch};
 use crate::{
     config::DeviceConfig,
     icons::{self, Icon},
-    mappings::{Kind, Screen},
+    mappings::{Kind, MAX_PAGES, Screen},
     mqtt::{self, Command, MqttEvent},
 };
 
@@ -42,6 +43,10 @@ const SLOW_OPERATION: Duration = Duration::from_millis(500);
 /// How long a button in multi-click mode waits after being released for another press, before it
 /// reports the ones it has counted
 const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
+/// How many pages of buttons a device has when it connects, until the retained page count from
+/// Home Assistant says otherwise. The first of them is the one it shows.
+const STARTUP_PAGES: u16 = 1;
 
 /// Carries out one thing we ask of a device, reporting it when it fails or drags.
 ///
@@ -181,7 +186,7 @@ async fn attempt(
         kind.encoder_count()
     );
 
-    mqtt::publish_discovery(mqtt_client, serial, kind).await;
+    mqtt::publish_discovery(mqtt_client, serial, kind, STARTUP_PAGES).await;
 
     let started = tokio::time::Instant::now();
     let result = session(
@@ -235,6 +240,29 @@ struct Backlight {
     dimmed: watch::Sender<bool>,
 }
 
+/// An image for a button screen, kept for whenever the page it is on is up
+struct Picture {
+    /// Already the size of the screen, so a big picture doesn't take up more than it shows
+    image: DynamicImage,
+    /// What to report the screen is showing
+    state: String,
+}
+
+/// The pages of buttons a device has, and what is on each of them.
+///
+/// The command loop is the only one that changes any of it. The input loop only needs to know
+/// which page is up, to tell which button was pressed, so that alone is a watch channel it shares.
+struct Pages<'a> {
+    /// How many pages there are
+    count: u16,
+    /// The page the device is showing
+    current: &'a watch::Sender<u16>,
+    /// What every button screen shows, on every page, by button id. A screen with no entry is
+    /// blank. Pages past `count` are kept too, so an image that arrives before the page count does
+    /// isn't lost, and a page that is taken away comes back as it was.
+    images: HashMap<u16, Picture>,
+}
+
 /// Sets the device up and then reads from it until it goes away or we're asked to shut down.
 /// The reader is dropped when this returns, so the caller can still talk to the device.
 async fn session(
@@ -272,7 +300,7 @@ async fn session(
     .await?;
 
     // Write the configured images to the device
-    set_images(device, kind, serial, config, mqtt_client).await?;
+    let images = set_images(device, kind, serial, config, mqtt_client).await?;
 
     // Flush
     timed(serial, "Sending the startup images", device.flush()).await?;
@@ -290,9 +318,21 @@ async fn session(
     // on it.
     let multi_click = watch::Sender::new(HashSet::new());
 
+    // The first page is up until Home Assistant says otherwise. Only the command loop changes it,
+    // but the input loop needs to know which page a button was pressed on.
+    let page = watch::Sender::new(0);
+    let pages = Pages {
+        count: STARTUP_PAGES,
+        current: &page,
+        images,
+    };
+
     mqtt::publish_timeout_state(mqtt_client, serial, true).await;
     mqtt::publish_brightness_state(mqtt_client, serial, config.brightness).await;
-    mqtt::publish_multi_click_states(mqtt_client, serial, kind, &HashSet::new()).await;
+    mqtt::publish_multi_click_states(mqtt_client, serial, kind, 0..STARTUP_PAGES, &HashSet::new())
+        .await;
+    mqtt::publish_page_count_state(mqtt_client, serial, STARTUP_PAGES).await;
+    mqtt::publish_page_state(mqtt_client, serial, 0).await;
 
     // Only ask for the commands Home Assistant has retained once the configured images are on the
     // device, so they arrive afterwards and take over rather than being overwritten
@@ -315,11 +355,13 @@ async fn session(
     let input = input_loop(
         &device,
         &reader,
+        kind,
         serial,
         config,
         mqtt_client,
         &backlight,
         &multi_click,
+        &page,
     );
     let commands = command_loop(
         &device,
@@ -329,6 +371,7 @@ async fn session(
         mqtt_events,
         &backlight,
         &multi_click,
+        pages,
     );
 
     tokio::select! {
@@ -341,7 +384,8 @@ async fn session(
 
 /// Carries out what Home Assistant asks of the device for as long as it is connected: the images
 /// to put on the screens it addresses, which buttons count their presses, whether those screens may
-/// dim, and how brightly they are lit
+/// dim, how brightly they are lit, and how many pages of buttons there are and which one is up
+#[allow(clippy::too_many_arguments)]
 async fn command_loop(
     device: &Mutex<&Device>,
     kind: Kind,
@@ -349,7 +393,8 @@ async fn command_loop(
     mqtt_client: &AsyncClient,
     events: &mut broadcast::Receiver<MqttEvent>,
     backlight: &Backlight,
-    multi_click: &watch::Sender<HashSet<u8>>,
+    multi_click: &watch::Sender<HashSet<u16>>,
+    mut pages: Pages<'_>,
 ) -> Result<(), MirajazzError> {
     use broadcast::error::RecvError;
 
@@ -365,6 +410,7 @@ async fn command_loop(
                             serial,
                             mqtt_client,
                             backlight,
+                            &mut pages,
                             screen,
                             payload,
                         )
@@ -377,7 +423,33 @@ async fn command_loop(
                         set_brightness(serial, mqtt_client, &backlight.brightness, percent).await;
                     }
                     Some(Command::MultiClick(id, enabled)) => {
-                        set_multi_click(kind, serial, mqtt_client, multi_click, id, enabled).await;
+                        set_multi_click(
+                            kind,
+                            serial,
+                            mqtt_client,
+                            multi_click,
+                            pages.count,
+                            id,
+                            enabled,
+                        )
+                        .await;
+                    }
+                    Some(Command::Page(page)) => {
+                        set_page(device, kind, serial, mqtt_client, backlight, &pages, page)
+                            .await?;
+                    }
+                    Some(Command::PageCount(count)) => {
+                        set_page_count(
+                            device,
+                            kind,
+                            serial,
+                            mqtt_client,
+                            backlight,
+                            multi_click,
+                            &mut pages,
+                            count,
+                        )
+                        .await?;
                     }
                     None => {}
                 }
@@ -388,11 +460,21 @@ async fn command_loop(
                 let enabled = *backlight.timeout.borrow();
                 let percent = *backlight.brightness.borrow();
                 let counting = multi_click.borrow().clone();
+                let page = *pages.current.borrow();
 
-                mqtt::publish_discovery(mqtt_client, serial, kind).await;
+                mqtt::publish_discovery(mqtt_client, serial, kind, pages.count).await;
                 mqtt::publish_timeout_state(mqtt_client, serial, enabled).await;
                 mqtt::publish_brightness_state(mqtt_client, serial, percent).await;
-                mqtt::publish_multi_click_states(mqtt_client, serial, kind, &counting).await;
+                mqtt::publish_multi_click_states(
+                    mqtt_client,
+                    serial,
+                    kind,
+                    0..pages.count,
+                    &counting,
+                )
+                .await;
+                mqtt::publish_page_count_state(mqtt_client, serial, pages.count).await;
+                mqtt::publish_page_state(mqtt_client, serial, page).await;
                 mqtt::subscribe_commands(mqtt_client, serial).await;
             }
             // Images are big, so only a few are kept waiting. Dropping the ones this device
@@ -420,15 +502,19 @@ async fn command_loop(
 ///
 /// A button reports each press as it goes down, unless it is one of those in `multi_click`. Those
 /// count their releases instead, and report how many there were once `MULTI_CLICK_WINDOW` passes
-/// without another.
+/// without another. Either way a press is reported as the button on the page that was up when it
+/// went down.
+#[allow(clippy::too_many_arguments)]
 async fn input_loop(
     device: &Mutex<&Device>,
     reader: &DeviceStateReader,
+    kind: Kind,
     serial: &str,
     config: &DeviceConfig,
     mqtt_client: &AsyncClient,
     backlight: &Backlight,
-    multi_click: &watch::Sender<HashSet<u8>>,
+    multi_click: &watch::Sender<HashSet<u16>>,
+    page: &watch::Sender<u16>,
 ) -> Result<(), MirajazzError> {
     use tokio::time::{Duration, Instant, sleep_until, timeout_at};
 
@@ -443,14 +529,16 @@ async fn input_loop(
     let mut timeout_changes = backlight.timeout.subscribe();
     let mut brightness_changes = backlight.brightness.subscribe();
 
-    // Buttons that went down while they were counting their presses. Whether a release counts is
-    // decided by this rather than by the mode at the time of the release, so a button switched
-    // over while it is held neither reports the same press twice nor loses it.
-    let mut held = HashSet::new();
+    // Physical buttons that went down while they were counting their presses, and the button id
+    // each went down as. Whether a release counts is decided by this rather than by the mode at the
+    // time of the release, so a button switched over while it is held neither reports the same
+    // press twice nor loses it. And the release counts for the button it was pressed as, even when
+    // the page changed while it was held, which the press itself often does.
+    let mut held: HashMap<u8, u16> = HashMap::new();
     // The presses counted so far for every button still waiting to see if another follows, and
     // when it stops waiting. A button that is down again has no such time: it can't be done
     // counting until it is released, however long it is held.
-    let mut presses: HashMap<u8, (u32, Option<Instant>)> = HashMap::new();
+    let mut presses: HashMap<u16, (u32, Option<Instant>)> = HashMap::new();
 
     loop {
         // The soonest any button is done counting, copied out so the counts can change below
@@ -577,35 +665,36 @@ async fn input_loop(
         // Event handler
         for update in updates {
             match update {
-                DeviceStateUpdate::ButtonDown(i) => {
-                    let counting = multi_click.borrow().contains(&i);
+                DeviceStateUpdate::ButtonDown(key) => {
+                    let id = kind.button_id(*page.borrow(), key);
+                    let counting = multi_click.borrow().contains(&id);
 
                     if counting {
-                        held.insert(i);
+                        held.insert(key, id);
 
                         // Pressed again in time, so hold off reporting until this press is
                         // released too, rather than letting the window run out while it is down
-                        if let Some((_, due)) = presses.get_mut(&i) {
+                        if let Some((_, due)) = presses.get_mut(&id) {
                             *due = None;
                         }
                     } else {
                         // Presses counted before the button stopped counting them happened first,
                         // so they are reported first
-                        if let Some((count, _)) = presses.remove(&i) {
-                            mqtt::handle_button(mqtt_client, serial, i, count).await;
+                        if let Some((count, _)) = presses.remove(&id) {
+                            mqtt::handle_button(mqtt_client, serial, id, count).await;
                         }
 
-                        mqtt::handle_button(mqtt_client, serial, i, 1).await;
+                        mqtt::handle_button(mqtt_client, serial, id, 1).await;
                     }
                 }
-                DeviceStateUpdate::ButtonUp(i) => {
-                    if held.remove(&i) {
+                DeviceStateUpdate::ButtonUp(key) => {
+                    if let Some(id) = held.remove(&key) {
                         // Every release gives the button the whole window again to be pressed once
                         // more
-                        let count = presses.get(&i).map_or(0, |&(count, _)| count);
+                        let count = presses.get(&id).map_or(0, |&(count, _)| count);
                         let due = Instant::now() + MULTI_CLICK_WINDOW;
 
-                        presses.insert(i, (count + 1, Some(due)));
+                        presses.insert(id, (count + 1, Some(due)));
                     }
                 }
                 DeviceStateUpdate::EncoderTwist(i, value) => {
@@ -705,17 +794,24 @@ async fn set_brightness(
 
 /// Switches a button between reporting each press as it goes down and counting its presses, and
 /// reports it back. The input loop is what acts on it, from the next time the button goes down.
+///
+/// A button on a page past the last one is switched all the same, since the retained setting can
+/// arrive before the page count does, but it is only reported once the device has its page.
 async fn set_multi_click(
     kind: Kind,
     serial: &str,
     mqtt_client: &AsyncClient,
-    multi_click: &watch::Sender<HashSet<u8>>,
-    id: u8,
+    multi_click: &watch::Sender<HashSet<u16>>,
+    pages: u16,
+    id: u16,
     enabled: bool,
 ) {
-    if id as usize >= kind.key_count() {
+    let (page, _) = kind.locate_button(id);
+
+    if page >= MAX_PAGES {
         println!(
-            "[{serial}] Ignoring multi-click setting for button {id}: the {} {} has {} buttons",
+            "[{serial}] Ignoring multi-click setting for button {id}: the {} {} has {} buttons on \
+             each of up to {MAX_PAGES} pages",
             kind.manufacturer(),
             kind.model(),
             kind.key_count()
@@ -744,7 +840,9 @@ async fn set_multi_click(
         kind.button_label(id)
     );
 
-    mqtt::publish_multi_click_state(mqtt_client, serial, kind, id, enabled).await;
+    if page < pages {
+        mqtt::publish_multi_click_state(mqtt_client, serial, kind, id, enabled).await;
+    }
 }
 
 /// Pings devices that drop the connection when idle. Never returns for devices that don't
@@ -814,47 +912,90 @@ async fn connect(dev: &HidDeviceInfo, kind: Kind) -> Result<Device, MirajazzErro
 }
 
 /// Writes the images from the config to the screens the device actually has, and reports what
-/// every one of them is showing, so Home Assistant starts out in step with the device.
+/// every screen that is showing is, so Home Assistant starts out in step with the device.
 ///
-/// The changes only reach the screens once they are flushed.
+/// Button images are kept for every page, and handed back for drawing each page as it comes up;
+/// only the ones on the first page are drawn now. The changes only reach the screens once they are
+/// flushed.
 async fn set_images(
     device: &Device,
     kind: Kind,
     serial: &str,
     config: &DeviceConfig,
     mqtt_client: &AsyncClient,
-) -> Result<(), MirajazzError> {
-    let configured = configured_icons(kind, serial, config);
+) -> Result<HashMap<u16, Picture>, MirajazzError> {
+    let mut buttons = HashMap::new();
+    let mut lcd = HashMap::new();
 
-    for screen in kind.screens() {
-        // `screens` only lists what this model has, so all of them resolve
+    for (screen, name) in configured_icons(kind, serial, config) {
+        // `configured_icons` only keeps the screens this model has, so all of them resolve
         let Some((hw_key, format)) = kind.resolve_screen(screen) else {
             continue;
         };
 
-        let state = match configured.get(&screen) {
-            // Every screen was blanked just before this, so one with no icon is already right
-            None => String::new(),
-            Some(name) => match icons::from_file(name) {
-                Ok(image) => {
-                    device.set_button_image(hw_key, format, image).await?;
+        let image = match icons::from_file(name) {
+            Ok(image) => image,
+            // An icon that can't be read leaves one screen blank rather than taking the whole
+            // device down
+            Err(e) => {
+                println!("[{serial}] Leaving {screen} blank: {e}");
 
-                    (*name).to_string()
-                }
-                // An icon that can't be read leaves one screen blank rather than taking the
-                // whole device down
-                Err(e) => {
-                    println!("[{serial}] Leaving {screen} blank: {e}");
-
-                    String::new()
-                }
-            },
+                continue;
+            }
         };
 
-        mqtt::publish_image_state(mqtt_client, serial, screen, &state).await;
+        match screen {
+            Screen::Button(id) => {
+                let picture = Picture {
+                    image: fit(image, format),
+                    state: name.to_string(),
+                };
+
+                buttons.insert(id, picture);
+            }
+            Screen::Lcd(_) => {
+                device.set_button_image(hw_key, format, image).await?;
+                lcd.insert(screen, name);
+            }
+        }
     }
 
-    Ok(())
+    // Every screen was blanked just before this, so one with no icon is already right
+    for screen in kind.page_screens(0) {
+        let (Screen::Button(id), Some((hw_key, format))) = (screen, kind.resolve_screen(screen))
+        else {
+            continue;
+        };
+
+        let state = match buttons.get(&id) {
+            Some(picture) => {
+                device
+                    .set_button_image(hw_key, format, picture.image.clone())
+                    .await?;
+
+                picture.state.as_str()
+            }
+            None => "",
+        };
+
+        mqtt::publish_image_state(mqtt_client, serial, screen, state).await;
+    }
+
+    for screen in kind.lcd_screens() {
+        let state = lcd.get(&screen).copied().unwrap_or_default();
+
+        mqtt::publish_image_state(mqtt_client, serial, screen, state).await;
+    }
+
+    Ok(buttons)
+}
+
+/// Brings an image down to the size of the screen it is for, the same way mirajazz does before
+/// sending it, so it looks no different and an image that is kept around takes no more than it shows
+fn fit(image: DynamicImage, format: ImageFormat) -> DynamicImage {
+    let (width, height) = format.size;
+
+    image.resize_exact(width as u32, height as u32, FilterType::Nearest)
 }
 
 /// Indexes the config's icons by the screen they belong to. The same config file is meant to
@@ -889,15 +1030,20 @@ fn configured_icons<'a>(
     icons
 }
 
-/// Draws one image sent by Home Assistant, and reports back what the screen is showing now.
+/// Handles one image sent by Home Assistant, and reports back what the screen is showing now.
 /// A command that doesn't make sense is reported and leaves the screen as it was, rather than
 /// ending the session.
+///
+/// An image for a button is kept for whenever its page is up, and only drawn now if it is up
+/// already. The LCD strip is the same whichever page is up, so its images are always drawn.
+#[allow(clippy::too_many_arguments)]
 async fn set_image(
     device: &Mutex<&Device>,
     kind: Kind,
     serial: &str,
     mqtt_client: &AsyncClient,
     backlight: &Backlight,
+    pages: &mut Pages<'_>,
     screen: Screen,
     payload: &[u8],
 ) -> Result<(), MirajazzError> {
@@ -910,8 +1056,16 @@ async fn set_image(
     // Decoding a picture someone else chose the size of is the one slow, purely CPU-bound step
     // in here, so get it off the async worker, the same way mirajazz does when it converts an
     // image for the device. Decoded before taking the device below, so the other loops aren't
-    // held up by it.
-    let icon = tokio::task::block_in_place(|| icons::from_payload(payload));
+    // held up by it. Fitting it to the screen is more of the same, so it happens here too.
+    let icon = tokio::task::block_in_place(|| {
+        icons::from_payload(payload).map(|icon| match icon {
+            Icon::Show { image, state } => Icon::Show {
+                image: fit(image, format),
+                state,
+            },
+            other => other,
+        })
+    });
 
     // What to put on the screen, and what to report back that it is showing. Decided before the
     // device is touched, because the commands that turn out to want nothing from it are the
@@ -928,6 +1082,34 @@ async fn set_image(
             return Ok(());
         }
     };
+
+    let showing = match kind.screen_page(screen) {
+        Some(page) => page == *pages.current.borrow(),
+        None => true,
+    };
+
+    if let Screen::Button(id) = screen {
+        match &image {
+            Some(image) => {
+                let picture = Picture {
+                    image: image.clone(),
+                    state: state.clone(),
+                };
+
+                pages.images.insert(id, picture);
+            }
+            None => {
+                pages.images.remove(&id);
+            }
+        }
+    }
+
+    // A page that isn't up has nothing to draw, and is no reason to wake the device either
+    if !showing {
+        mqtt::publish_image_state(mqtt_client, serial, screen, &state).await;
+
+        return Ok(());
+    }
 
     // Held across all of it: the flush is where the image is actually transferred, and it is that
     // transfer the other loops must not write into
@@ -977,9 +1159,190 @@ async fn set_image(
     Ok(())
 }
 
+/// Shows another page of buttons, as Home Assistant asks. A page the device doesn't have is
+/// reported and ignored, rather than ending the session.
+async fn set_page(
+    device: &Mutex<&Device>,
+    kind: Kind,
+    serial: &str,
+    mqtt_client: &AsyncClient,
+    backlight: &Backlight,
+    pages: &Pages<'_>,
+    page: u16,
+) -> Result<(), MirajazzError> {
+    if page >= pages.count {
+        println!(
+            "[{serial}] Ignoring page {page}: the device has {} page(s), numbered from 0",
+            pages.count
+        );
+
+        return Ok(());
+    }
+
+    // A command that says what the page already is happens on every reconnect, when the broker
+    // replays the retained one, and isn't worth redrawing the screens over
+    if *pages.current.borrow() == page {
+        return Ok(());
+    }
+
+    show_page(device, kind, serial, mqtt_client, backlight, pages, page).await
+}
+
+/// Changes how many pages of buttons the device has, as Home Assistant asks, and reports it back.
+///
+/// A page that is added gets its buttons' entities and triggers published, and one that is taken
+/// away has them taken back. What was on a page taken away is kept, so adding it again brings it
+/// back as it was. A device showing a page it no longer has moves to the last one it still does.
+#[allow(clippy::too_many_arguments)]
+async fn set_page_count(
+    device: &Mutex<&Device>,
+    kind: Kind,
+    serial: &str,
+    mqtt_client: &AsyncClient,
+    backlight: &Backlight,
+    multi_click: &watch::Sender<HashSet<u16>>,
+    pages: &mut Pages<'_>,
+    count: u16,
+) -> Result<(), MirajazzError> {
+    let previous = pages.count;
+
+    // A command that says what the count already is happens on every reconnect, when the broker
+    // replays the retained one, and isn't worth republishing every entity over
+    if count == previous {
+        return Ok(());
+    }
+
+    pages.count = count;
+
+    println!("[{serial}] Page count set to {count}");
+
+    // The page number's range follows the count, and Home Assistant only takes a state that is in
+    // range, so it is widened before anything on a new page is reported
+    mqtt::publish_page_number_discovery(mqtt_client, serial, kind, count).await;
+
+    if count > previous {
+        for page in previous..count {
+            mqtt::publish_page_discovery(mqtt_client, serial, kind, page).await;
+
+            for screen in kind.page_screens(page) {
+                let Screen::Button(id) = screen else {
+                    continue;
+                };
+
+                let state = pages.images.get(&id).map_or("", |picture| &picture.state);
+
+                mqtt::publish_image_state(mqtt_client, serial, screen, state).await;
+            }
+        }
+
+        let counting = multi_click.borrow().clone();
+        mqtt::publish_multi_click_states(mqtt_client, serial, kind, previous..count, &counting)
+            .await;
+    } else {
+        for page in count..previous {
+            mqtt::remove_page_discovery(mqtt_client, serial, kind, page).await;
+        }
+
+        let current = *pages.current.borrow();
+
+        if current >= count {
+            show_page(
+                device,
+                kind,
+                serial,
+                mqtt_client,
+                backlight,
+                pages,
+                count - 1,
+            )
+            .await?;
+        }
+    }
+
+    mqtt::publish_page_count_state(mqtt_client, serial, count).await;
+
+    Ok(())
+}
+
+/// Puts a page up on the device: every button screen is redrawn with what that page has on it, and
+/// the page is reported back
+async fn show_page(
+    device: &Mutex<&Device>,
+    kind: Kind,
+    serial: &str,
+    mqtt_client: &AsyncClient,
+    backlight: &Backlight,
+    pages: &Pages<'_>,
+    page: u16,
+) -> Result<(), MirajazzError> {
+    // Held across the whole redraw, for the same reason `set_image` holds it
+    let device = device.lock().await;
+
+    // Woken first, for the same reason `set_image` wakes it: a sleeping screen is no state to draw
+    // a whole page on
+    let level = *backlight.brightness.borrow();
+    wake(*device, serial, &backlight.dimmed, level).await;
+
+    // Switched before drawing, so a button pressed while the page is going up is already one of
+    // this page's
+    pages.current.send_replace(page);
+
+    timed(
+        serial,
+        &format!("Converting the images for page {page}"),
+        draw_page(*device, kind, &pages.images, page),
+    )
+    .await?;
+
+    timed(
+        serial,
+        &format!("Sending page {page} to the device"),
+        device.flush(),
+    )
+    .await?;
+
+    drop(device);
+
+    println!("[{serial}] Showing page {page}");
+
+    mqtt::publish_page_state(mqtt_client, serial, page).await;
+
+    Ok(())
+}
+
+/// Puts every button screen's image for one page on the device, blanking the screens that page has
+/// nothing for. The images only reach the screens once they are flushed.
+///
+/// Takes the device rather than the lock around it, because the caller is already holding it.
+async fn draw_page(
+    device: &Device,
+    kind: Kind,
+    images: &HashMap<u16, Picture>,
+    page: u16,
+) -> Result<(), MirajazzError> {
+    for screen in kind.page_screens(page) {
+        let (Screen::Button(id), Some((hw_key, format))) = (screen, kind.resolve_screen(screen))
+        else {
+            continue;
+        };
+
+        match images.get(&id) {
+            Some(picture) => {
+                device
+                    .set_button_image(hw_key, format, picture.image.clone())
+                    .await?
+            }
+            None => device.clear_button_image(hw_key).await?,
+        }
+    }
+
+    Ok(())
+}
+
 fn report_missing_screen(serial: &str, kind: Kind, screen: Screen) {
     println!(
-        "[{serial}] Ignoring image for {screen}: the {} {} has {} button screens and {} LCD segments",
+        "[{serial}] Ignoring image for {screen}: the {} {} has {} button screens on each of up to \
+         {MAX_PAGES} pages, and {} LCD segments",
         kind.manufacturer(),
         kind.model(),
         kind.screen_key_count(),
