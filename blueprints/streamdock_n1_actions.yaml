@@ -10,7 +10,9 @@ blueprint:
     your Stream Dock device), or just use `streamdock/<serial>/trigger`.
     Buttons 0-14 are the key screens, numbered left to right and top to bottom,
     and buttons 15-16 are the two buttons above the LCD strip. Leave any you
-    don't use empty.
+    don't use empty. Double and triple presses are only reported by buttons
+    whose multi-click switch is turned on (under Configuration on the device
+    page).
   domain: automation
   input:
     streamdock_topic:
@@ -108,6 +110,186 @@ blueprint:
           default: []
           selector:
             action: {}
+    buttons_double:
+      name: Double presses
+      icon: mdi:gesture-double-tap
+      collapsed: true
+      input:
+        button_0_double_action:
+          name: Button 0 double pressed
+          default: []
+          selector:
+            action: {}
+        button_1_double_action:
+          name: Button 1 double pressed
+          default: []
+          selector:
+            action: {}
+        button_2_double_action:
+          name: Button 2 double pressed
+          default: []
+          selector:
+            action: {}
+        button_3_double_action:
+          name: Button 3 double pressed
+          default: []
+          selector:
+            action: {}
+        button_4_double_action:
+          name: Button 4 double pressed
+          default: []
+          selector:
+            action: {}
+        button_5_double_action:
+          name: Button 5 double pressed
+          default: []
+          selector:
+            action: {}
+        button_6_double_action:
+          name: Button 6 double pressed
+          default: []
+          selector:
+            action: {}
+        button_7_double_action:
+          name: Button 7 double pressed
+          default: []
+          selector:
+            action: {}
+        button_8_double_action:
+          name: Button 8 double pressed
+          default: []
+          selector:
+            action: {}
+        button_9_double_action:
+          name: Button 9 double pressed
+          default: []
+          selector:
+            action: {}
+        button_10_double_action:
+          name: Button 10 double pressed
+          default: []
+          selector:
+            action: {}
+        button_11_double_action:
+          name: Button 11 double pressed
+          default: []
+          selector:
+            action: {}
+        button_12_double_action:
+          name: Button 12 double pressed
+          default: []
+          selector:
+            action: {}
+        button_13_double_action:
+          name: Button 13 double pressed
+          default: []
+          selector:
+            action: {}
+        button_14_double_action:
+          name: Button 14 double pressed
+          default: []
+          selector:
+            action: {}
+        button_15_double_action:
+          name: Top button left double pressed
+          default: []
+          selector:
+            action: {}
+        button_16_double_action:
+          name: Top button right double pressed
+          default: []
+          selector:
+            action: {}
+    buttons_triple:
+      name: Triple presses
+      icon: mdi:numeric-3-circle-outline
+      collapsed: true
+      input:
+        button_0_triple_action:
+          name: Button 0 triple pressed
+          default: []
+          selector:
+            action: {}
+        button_1_triple_action:
+          name: Button 1 triple pressed
+          default: []
+          selector:
+            action: {}
+        button_2_triple_action:
+          name: Button 2 triple pressed
+          default: []
+          selector:
+            action: {}
+        button_3_triple_action:
+          name: Button 3 triple pressed
+          default: []
+          selector:
+            action: {}
+        button_4_triple_action:
+          name: Button 4 triple pressed
+          default: []
+          selector:
+            action: {}
+        button_5_triple_action:
+          name: Button 5 triple pressed
+          default: []
+          selector:
+            action: {}
+        button_6_triple_action:
+          name: Button 6 triple pressed
+          default: []
+          selector:
+            action: {}
+        button_7_triple_action:
+          name: Button 7 triple pressed
+          default: []
+          selector:
+            action: {}
+        button_8_triple_action:
+          name: Button 8 triple pressed
+          default: []
+          selector:
+            action: {}
+        button_9_triple_action:
+          name: Button 9 triple pressed
+          default: []
+          selector:
+            action: {}
+        button_10_triple_action:
+          name: Button 10 triple pressed
+          default: []
+          selector:
+            action: {}
+        button_11_triple_action:
+          name: Button 11 triple pressed
+          default: []
+          selector:
+            action: {}
+        button_12_triple_action:
+          name: Button 12 triple pressed
+          default: []
+          selector:
+            action: {}
+        button_13_triple_action:
+          name: Button 13 triple pressed
+          default: []
+          selector:
+            action: {}
+        button_14_triple_action:
+          name: Button 14 triple pressed
+          default: []
+          selector:
+            action: {}
+        button_15_triple_action:
+          name: Top button left triple pressed
+          default: []
+          selector:
+            action: {}
+        button_16_triple_action:
+          name: Top button right triple pressed
+          default: []
+          selector:
+            action: {}
     knobs:
       name: Knobs
       icon: mdi:knob
@@ -171,6 +353,74 @@ actions:
         sequence: !input button_15_action
       - conditions: "{{ trigger.payload == 'button_16_press' }}"
         sequence: !input button_16_action
+      - conditions: "{{ trigger.payload == 'button_0_press_2' }}"
+        sequence: !input button_0_double_action
+      - conditions: "{{ trigger.payload == 'button_1_press_2' }}"
+        sequence: !input button_1_double_action
+      - conditions: "{{ trigger.payload == 'button_2_press_2' }}"
+        sequence: !input button_2_double_action
+      - conditions: "{{ trigger.payload == 'button_3_press_2' }}"
+        sequence: !input button_3_double_action
+      - conditions: "{{ trigger.payload == 'button_4_press_2' }}"
+        sequence: !input button_4_double_action
+      - conditions: "{{ trigger.payload == 'button_5_press_2' }}"
+        sequence: !input button_5_double_action
+      - conditions: "{{ trigger.payload == 'button_6_press_2' }}"
+        sequence: !input button_6_double_action
+      - conditions: "{{ trigger.payload == 'button_7_press_2' }}"
+        sequence: !input button_7_double_action
+      - conditions: "{{ trigger.payload == 'button_8_press_2' }}"
+        sequence: !input button_8_double_action
+      - conditions: "{{ trigger.payload == 'button_9_press_2' }}"
+        sequence: !input button_9_double_action
+      - conditions: "{{ trigger.payload == 'button_10_press_2' }}"
+        sequence: !input button_10_double_action
+      - conditions: "{{ trigger.payload == 'button_11_press_2' }}"
+        sequence: !input button_11_double_action
+      - conditions: "{{ trigger.payload == 'button_12_press_2' }}"
+        sequence: !input button_12_double_action
+      - conditions: "{{ trigger.payload == 'button_13_press_2' }}"
+        sequence: !input button_13_double_action
+      - conditions: "{{ trigger.payload == 'button_14_press_2' }}"
+        sequence: !input button_14_double_action
+      - conditions: "{{ trigger.payload == 'button_15_press_2' }}"
+        sequence: !input button_15_double_action
+      - conditions: "{{ trigger.payload == 'button_16_press_2' }}"
+        sequence: !input button_16_double_action
+      - conditions: "{{ trigger.payload == 'button_0_press_3' }}"
+        sequence: !input button_0_triple_action
+      - conditions: "{{ trigger.payload == 'button_1_press_3' }}"
+        sequence: !input button_1_triple_action
+      - conditions: "{{ trigger.payload == 'button_2_press_3' }}"
+        sequence: !input button_2_triple_action
+      - conditions: "{{ trigger.payload == 'button_3_press_3' }}"
+        sequence: !input button_3_triple_action
+      - conditions: "{{ trigger.payload == 'button_4_press_3' }}"
+        sequence: !input button_4_triple_action
+      - conditions: "{{ trigger.payload == 'button_5_press_3' }}"
+        sequence: !input button_5_triple_action
+      - conditions: "{{ trigger.payload == 'button_6_press_3' }}"
+        sequence: !input button_6_triple_action
+      - conditions: "{{ trigger.payload == 'button_7_press_3' }}"
+        sequence: !input button_7_triple_action
+      - conditions: "{{ trigger.payload == 'button_8_press_3' }}"
+        sequence: !input button_8_triple_action
+      - conditions: "{{ trigger.payload == 'button_9_press_3' }}"
+        sequence: !input button_9_triple_action
+      - conditions: "{{ trigger.payload == 'button_10_press_3' }}"
+        sequence: !input button_10_triple_action
+      - conditions: "{{ trigger.payload == 'button_11_press_3' }}"
+        sequence: !input button_11_triple_action
+      - conditions: "{{ trigger.payload == 'button_12_press_3' }}"
+        sequence: !input button_12_triple_action
+      - conditions: "{{ trigger.payload == 'button_13_press_3' }}"
+        sequence: !input button_13_triple_action
+      - conditions: "{{ trigger.payload == 'button_14_press_3' }}"
+        sequence: !input button_14_triple_action
+      - conditions: "{{ trigger.payload == 'button_15_press_3' }}"
+        sequence: !input button_15_triple_action
+      - conditions: "{{ trigger.payload == 'button_16_press_3' }}"
+        sequence: !input button_16_triple_action
       - conditions: "{{ trigger.payload == 'knob_0_left' }}"
         sequence: !input knob_0_left_action
       - conditions: "{{ trigger.payload == 'knob_0_right' }}"
@@ -178,4 +428,5 @@ actions:
       - conditions: "{{ trigger.payload == 'knob_0_press' }}"
         sequence: !input knob_0_press_action
 
-mode: single
+mode: parallel
+max: 5

@@ -7,3 +7,5 @@ config.toml
 # Images
 examples/
 images/
+
+.DS_Store

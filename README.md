@@ -206,6 +206,23 @@ actions:
 
 Whole numbers are what Home Assistant's slider sends, and a decimal such as `39.6` is accepted too and rounded. Publish with `retain: true` (which the slider does for you) and the brightness survives a restart of either side; without it the screens go back to the `config.toml` level as soon as the device next reconnects. A payload that isn't a number, or one outside 0-100, is logged and ignored rather than clamped, so a value in the wrong units doesn't quietly darken the device.
 
+## Pressing a button more than once
+
+By default a button reports a press the moment it goes down, as `button_<id>_press`. To give one button separate actions for a double or triple press, turn on its "Button <id> multi-click" switch, listed under Configuration on the device page next to the image entities.
+
+A button in multi-click mode waits until it is released, and then gives you 400ms to press it again. A press within that window is counted, and the window starts over once that press is released too, however long the button was held. Once the window runs out with no further press, the count is reported: a single press is still `button_<id>_press`, and more are `button_<id>_press_<count>` (`button_3_press_2` for a double press). A single press therefore arrives a little later than it does with the switch off, and only after the button has been released.
+
+While the switch is on, the device also gets "double", "triple", "quadruple" and "quintuple" press triggers for that button, which Home Assistant's device automation editor offers alongside the usual one. They are removed again when the switch is turned off. The [blueprints](#setting-up-automations-in-home-assistant) have a double and a triple press action for every button, in their own collapsed sections. Longer runs of presses are still published on the trigger topic, but Home Assistant has no device trigger for them, so use an MQTT trigger matching the payload instead.
+
+### Switching it from an automation
+
+| Topic | What it does |
+| --- | --- |
+| `streamdock/<serial>/button/<id>/multi_click/set` | `ON` counts the button's presses, `OFF` reports each press as soon as the button goes down |
+| `streamdock/<serial>/button/<id>/multi_click` | Reports which of the two it currently is (published by the app, don't write to it) |
+
+It takes the same payloads as the [screen timeout](#switching-it-from-an-automation), and like the timeout it survives a restart of either side when published with `retain: true`, which the switch does for you.
+
 ## Setting up automations in Home Assistant
 
 Once the app is running and connected to your MQTT broker, it publishes discovery data and a new device named "Stream Dock (...)" appears under Settings -> Devices & Services -> MQTT. From there you can build one "Device" automation per button/knob trigger (Settings -> Automations -> Add Automation -> When -> Device -> select the Stream Dock device -> pick a trigger such as "Button 1 pressed" or "Knob 0 rotated left/right").
@@ -231,6 +248,7 @@ Which means `vendor_id = 0x6603` and `product_id = 0x1003`. If the device is rec
 ## Features
 
 - Register buttons and knobs as Home Assistant MQTT device triggers, so actions are defined via HA automations
+- Tell double, triple and longer presses of a button apart, turned on per button from Home Assistant
 - Support for multiple device models, detected automatically by USB ID
 - Run several devices at once, each with its own HA device and optionally its own settings
 - Pick up devices as they are plugged in and drop them as they are unplugged, without a restart

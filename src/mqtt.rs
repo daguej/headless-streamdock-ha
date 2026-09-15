@@ -1,7 +1,7 @@
 use dotenv::dotenv;
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, Publish, QoS};
 use serde_json::json;
-use std::{env::var, time::Duration};
+use std::{collections::HashSet, env::var, time::Duration};
 use tokio::{sync::broadcast, task::JoinHandle};
 
 use crate::{
@@ -39,6 +39,16 @@ const MAX_BRIGHTNESS: u8 = 100;
 const PAYLOAD_ON: &str = "ON";
 const PAYLOAD_OFF: &str = "OFF";
 
+/// Home Assistant's trigger types for a button pressed several times in a row, by how many presses
+/// each stands for. It has none past five, so a longer run is still published, but only an MQTT
+/// trigger matching the payload itself (such as the blueprints use) can pick it up.
+const MULTI_PRESS_TYPES: [(u32, &str); 4] = [
+    (2, "button_double_press"),
+    (3, "button_triple_press"),
+    (4, "button_quadruple_press"),
+    (5, "button_quintuple_press"),
+];
+
 /// What an incoming message asks a device to do
 #[derive(Debug, PartialEq)]
 pub enum Command<'a> {
@@ -49,6 +59,9 @@ pub enum Command<'a> {
     Timeout(bool),
     /// Light the screens at this percentage of full brightness
     Brightness(u8),
+    /// Count a button's presses in quick succession and report them together, or report every
+    /// press the moment the button goes down
+    MultiClick(u8, bool),
 }
 
 /// Something that happened on the MQTT connection and that the devices need to know about
@@ -159,6 +172,16 @@ fn brightness_command_topic(device_id: &str) -> String {
     format!("{}/set", brightness_topic(device_id))
 }
 
+/// Where it is reported whether a button counts its presses
+fn multi_click_topic(device_id: &str, id: u8) -> String {
+    format!("{TOPIC_ROOT}/{device_id}/button/{id}/multi_click")
+}
+
+/// Where a button's multi-click mode is turned on and off
+fn multi_click_command_topic(device_id: &str, id: u8) -> String {
+    format!("{}/set", multi_click_topic(device_id, id))
+}
+
 /// Identifies a screen's entity within its device
 fn image_object_id(screen: Screen) -> String {
     match screen {
@@ -167,19 +190,36 @@ fn image_object_id(screen: Screen) -> String {
     }
 }
 
-// Publishes retained HA MQTT discovery configs for one device: a device-automation trigger per
-// button and three (rotate_left/rotate_right/press) per knob, a text entity per screen to set the
-// image it shows, a switch for the screen timeout and a number for the screen brightness. How many
-// of each there are depends on the model of the device.
-pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind) {
-    let prefix = discovery_prefix();
-    let topic = trigger_topic(device_id);
-    let device = json!({
+/// What is published on the trigger topic when a button is pressed this many times in a row. A
+/// single press keeps the name it had before buttons could count their presses.
+fn button_press_payload(id: u8, presses: u32) -> String {
+    match presses {
+        1 => format!("button_{id}_press"),
+        _ => format!("button_{id}_press_{presses}"),
+    }
+}
+
+/// The Home Assistant device every entity and trigger of one dock belongs to
+fn device_info(device_id: &str, kind: Kind) -> serde_json::Value {
+    json!({
         "identifiers": [format!("{TOPIC_ROOT}_{device_id}")],
         "name": format!("Stream Dock ({device_id})"),
         "manufacturer": kind.manufacturer(),
         "model": kind.model(),
-    });
+    })
+}
+
+// Publishes retained HA MQTT discovery configs for one device: a device-automation trigger per
+// button and three (rotate_left/rotate_right/press) per knob, a text entity per screen to set the
+// image it shows, a switch per button for its multi-click mode, a switch for the screen timeout and
+// a number for the screen brightness. How many of each there are depends on the model of the device.
+//
+// The triggers for pressing a button several times in a row come and go with its multi-click mode,
+// so they are published along with its state instead, by `publish_multi_click_states`.
+pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind) {
+    let prefix = discovery_prefix();
+    let topic = trigger_topic(device_id);
+    let device = device_info(device_id, kind);
 
     for id in 0..kind.key_count() as u8 {
         let payload = json!({
@@ -188,7 +228,7 @@ pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind
             "topic": topic,
             "type": "button_short_press",
             "subtype": kind.button_label(id),
-            "payload": format!("button_{id}_press"),
+            "payload": button_press_payload(id, 1),
             "device": device,
         });
 
@@ -248,6 +288,25 @@ pub async fn publish_discovery(client: &AsyncClient, device_id: &str, kind: Kind
         });
 
         publish_discovery_config(client, &prefix, "text", device_id, &object_id, &payload).await;
+    }
+
+    // Retained like the images, so a button keeps counting its presses after either side restarts
+    for id in 0..kind.key_count() as u8 {
+        let object_id = format!("button_{id}_multi_click");
+        let payload = json!({
+            "name": format!("{} multi-click", kind.button_label(id)),
+            "unique_id": format!("{TOPIC_ROOT}_{device_id}_{object_id}"),
+            "command_topic": multi_click_command_topic(device_id, id),
+            "state_topic": multi_click_topic(device_id, id),
+            "payload_on": PAYLOAD_ON,
+            "payload_off": PAYLOAD_OFF,
+            "retain": true,
+            "entity_category": "config",
+            "icon": "mdi:gesture-double-tap",
+            "device": device,
+        });
+
+        publish_discovery_config(client, &prefix, "switch", device_id, &object_id, &payload).await;
     }
 
     // Retained for the same reason the images are: it is the retained command that brings the
@@ -319,16 +378,34 @@ async fn publish_discovery_config(
         .unwrap_or_else(|_| println!("Failed to publish discovery config for {object_id}"));
 }
 
-/// Asks for the commands addressed to one device: the images for its screens, the state of its
-/// screen timeout and the brightness its screens are lit at.
+/// Takes back a discovery config, which Home Assistant reads as the entity or trigger being gone.
+/// Harmless for one that was never published.
+async fn remove_discovery_config(
+    client: &AsyncClient,
+    prefix: &str,
+    component: &str,
+    device_id: &str,
+    object_id: &str,
+) {
+    let topic = format!("{prefix}/{component}/{device_id}/{object_id}/config");
+    client
+        .publish(topic, QoS::AtLeastOnce, true, "")
+        .await
+        .unwrap_or_else(|_| println!("Failed to remove discovery config for {object_id}"));
+}
+
+/// Asks for the commands addressed to one device: the images for its screens, which of its buttons
+/// count their presses, the state of its screen timeout and the brightness its screens are lit at.
 ///
 /// This has to be repeated on every new connection, because an MQTT session starts with no
 /// subscriptions. The broker replays the retained commands each time, which is what restores the
-/// screens and the two settings after this app restarts or the connection drops.
+/// screens and the settings after this app restarts or the connection drops.
 pub async fn subscribe_commands(client: &AsyncClient, device_id: &str) {
-    // One filter covers every screen: the image commands only differ in the button/lcd path
+    // One filter covers every screen: the image commands only differ in the button/lcd path. And
+    // one covers every button's multi-click mode, which only differ in the button id.
     let filters = [
         format!("{TOPIC_ROOT}/{device_id}/+/+/image/set"),
+        format!("{TOPIC_ROOT}/{device_id}/button/+/multi_click/set"),
         timeout_command_topic(device_id),
         brightness_command_topic(device_id),
     ];
@@ -351,8 +428,13 @@ fn parse_command<'a>(topic: &str, payload: &'a [u8], device_id: &str) -> Option<
         return Some(Command::Image(screen, payload));
     }
 
+    if let Some(id) = parse_multi_click_command(topic, device_id) {
+        return parse_switch(payload, device_id, "multi-click")
+            .map(|enabled| Command::MultiClick(id, enabled));
+    }
+
     if topic == timeout_command_topic(device_id) {
-        return parse_timeout(payload, device_id).map(Command::Timeout);
+        return parse_switch(payload, device_id, "screen timeout").map(Command::Timeout);
     }
 
     if topic == brightness_command_topic(device_id) {
@@ -362,12 +444,12 @@ fn parse_command<'a>(topic: &str, payload: &'a [u8], device_id: &str) -> Option<
     None
 }
 
-/// Reads an on/off payload, accepting the spellings Home Assistant and the command line both
-/// use. An empty payload is a retained command being cleared rather than a setting, so it says
-/// nothing about what the timeout should be.
-fn parse_timeout(payload: &[u8], device_id: &str) -> Option<bool> {
+/// Reads an on/off payload for the setting named by `what`, accepting the spellings Home Assistant
+/// and the command line both use. An empty payload is a retained command being cleared rather than
+/// a setting, so it says nothing about what the setting should be.
+fn parse_switch(payload: &[u8], device_id: &str, what: &str) -> Option<bool> {
     let Ok(text) = str::from_utf8(payload) else {
-        println!("[{device_id}] Ignoring a screen timeout command that isn't text");
+        println!("[{device_id}] Ignoring a {what} command that isn't text");
 
         return None;
     };
@@ -380,8 +462,7 @@ fn parse_timeout(payload: &[u8], device_id: &str) -> Option<bool> {
         "" => None,
         _ => {
             println!(
-                "[{device_id}] Ignoring screen timeout command '{}', expected {PAYLOAD_ON} or \
-                 {PAYLOAD_OFF}",
+                "[{device_id}] Ignoring {what} command '{}', expected {PAYLOAD_ON} or {PAYLOAD_OFF}",
                 Shortened(command)
             );
 
@@ -445,6 +526,18 @@ fn parse_image_command(topic: &str, device_id: &str) -> Option<Screen> {
     }
 }
 
+/// Picks out which button a multi-click command is for
+fn parse_multi_click_command(topic: &str, device_id: &str) -> Option<u8> {
+    topic
+        .strip_prefix(TOPIC_ROOT)?
+        .strip_prefix('/')?
+        .strip_prefix(device_id)?
+        .strip_prefix("/button/")?
+        .strip_suffix("/multi_click/set")?
+        .parse()
+        .ok()
+}
+
 /// Reports what a screen is showing, so the Home Assistant entity for it matches the device.
 /// Retained, so it is still right for a Home Assistant that restarts while this app keeps running.
 ///
@@ -496,8 +589,86 @@ pub async fn publish_brightness_state(client: &AsyncClient, device_id: &str, per
         });
 }
 
-pub async fn handle_button(client: &AsyncClient, device_id: &str, i: u8) {
-    publish_trigger(client, device_id, &format!("button_{i}_press")).await;
+/// Reports whether each of a device's buttons counts its presses, so the Home Assistant switches
+/// match the device. Retained, like the other settings.
+///
+/// Also publishes the triggers for pressing a button several times in a row for the buttons that
+/// count their presses, and takes them back for the ones that don't, so a device only offers the
+/// triggers that can actually fire.
+pub async fn publish_multi_click_states(
+    client: &AsyncClient,
+    device_id: &str,
+    kind: Kind,
+    enabled: &HashSet<u8>,
+) {
+    for id in 0..kind.key_count() as u8 {
+        publish_multi_click_state(client, device_id, kind, id, enabled.contains(&id)).await;
+    }
+}
+
+/// Reports whether one button counts its presses, and publishes or takes back its triggers for
+/// being pressed several times in a row to match. See `publish_multi_click_states`.
+pub async fn publish_multi_click_state(
+    client: &AsyncClient,
+    device_id: &str,
+    kind: Kind,
+    id: u8,
+    enabled: bool,
+) {
+    let state = if enabled { PAYLOAD_ON } else { PAYLOAD_OFF };
+
+    client
+        .publish(
+            multi_click_topic(device_id, id),
+            QoS::AtLeastOnce,
+            true,
+            state,
+        )
+        .await
+        .unwrap_or_else(|_| {
+            println!("[{device_id}] Failed to publish the multi-click state of button {id}")
+        });
+
+    let prefix = discovery_prefix();
+    let topic = trigger_topic(device_id);
+    let device = device_info(device_id, kind);
+
+    for (presses, trigger_type) in MULTI_PRESS_TYPES {
+        let object_id = format!("button_{id}_press_{presses}");
+
+        if !enabled {
+            remove_discovery_config(client, &prefix, "device_automation", device_id, &object_id)
+                .await;
+
+            continue;
+        }
+
+        let payload = json!({
+            "automation_type": "trigger",
+            "platform": "device_automation",
+            "topic": topic,
+            "type": trigger_type,
+            "subtype": kind.button_label(id),
+            "payload": button_press_payload(id, presses),
+            "device": device,
+        });
+
+        publish_discovery_config(
+            client,
+            &prefix,
+            "device_automation",
+            device_id,
+            &object_id,
+            &payload,
+        )
+        .await;
+    }
+}
+
+/// Reports a button being pressed this many times in a row, which is always once for a button
+/// that doesn't count its presses
+pub async fn handle_button(client: &AsyncClient, device_id: &str, i: u8, presses: u32) {
+    publish_trigger(client, device_id, &button_press_payload(i, presses)).await;
 }
 
 pub async fn handle_knob(client: &AsyncClient, device_id: &str, i: u8, value: i8) {
@@ -573,7 +744,7 @@ mod tests {
     fn the_timeout_takes_the_spellings_home_assistant_and_a_shell_send() {
         for payload in ["ON", "on", "true", "1", " ON\n"] {
             assert_eq!(
-                parse_timeout(payload.as_bytes(), SERIAL),
+                parse_switch(payload.as_bytes(), SERIAL, "screen timeout"),
                 Some(true),
                 "'{payload}' should have switched the timeout on"
             );
@@ -581,7 +752,7 @@ mod tests {
 
         for payload in ["OFF", "off", "false", "0", " OFF\n"] {
             assert_eq!(
-                parse_timeout(payload.as_bytes(), SERIAL),
+                parse_switch(payload.as_bytes(), SERIAL, "screen timeout"),
                 Some(false),
                 "'{payload}' should have switched the timeout off"
             );
@@ -598,8 +769,64 @@ mod tests {
             // Not text at all, such as an image sent to the wrong topic
             &[0xff, 0xfe][..],
         ] {
-            assert_eq!(parse_timeout(payload, SERIAL), None);
+            assert_eq!(parse_switch(payload, SERIAL, "screen timeout"), None);
         }
+    }
+
+    #[test]
+    fn a_multi_click_command_names_the_button_it_addresses() {
+        for id in [0, 8, 16] {
+            let topic = multi_click_command_topic(SERIAL, id);
+
+            assert_eq!(
+                parse_command(&topic, b"ON", SERIAL),
+                Some(Command::MultiClick(id, true))
+            );
+            assert_eq!(
+                parse_command(&topic, b"OFF", SERIAL),
+                Some(Command::MultiClick(id, false))
+            );
+        }
+    }
+
+    #[test]
+    fn the_multi_click_command_is_not_mistaken_for_an_image() {
+        // The image filter's `+/+` sits at the same depth, so the two must not swallow each other
+        let topic = multi_click_command_topic(SERIAL, 0);
+        assert_eq!(parse_image_command(&topic, SERIAL), None);
+
+        let image = image_command_topic(SERIAL, Screen::Button(0));
+        assert_eq!(parse_multi_click_command(&image, SERIAL), None);
+    }
+
+    #[test]
+    fn topics_that_are_not_multi_click_commands_are_ignored() {
+        for topic in [
+            // The state it reports, rather than the command
+            &multi_click_topic(SERIAL, 0),
+            // Another device's button
+            &multi_click_command_topic("CL87654321", 0),
+            // Only buttons count presses
+            &format!("{TOPIC_ROOT}/{SERIAL}/lcd/0/multi_click/set"),
+            // A button id that isn't a number, or doesn't fit one
+            &format!("{TOPIC_ROOT}/{SERIAL}/button/left/multi_click/set"),
+            &format!("{TOPIC_ROOT}/{SERIAL}/button/300/multi_click/set"),
+            // A serial that merely starts with ours
+            &format!("{TOPIC_ROOT}/{SERIAL}9/button/0/multi_click/set"),
+        ] {
+            assert_eq!(
+                parse_multi_click_command(topic, SERIAL),
+                None,
+                "{topic} should not have been treated as a multi-click command"
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_press_keeps_its_name_and_more_are_numbered() {
+        assert_eq!(button_press_payload(3, 1), "button_3_press");
+        assert_eq!(button_press_payload(3, 2), "button_3_press_2");
+        assert_eq!(button_press_payload(16, 7), "button_16_press_7");
     }
 
     #[test]

@@ -5,7 +5,11 @@ use mirajazz::{
     types::HidDeviceInfo,
 };
 use rumqttc::AsyncClient;
-use std::{collections::HashMap, future::Future, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    time::Duration,
+};
 use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::{
@@ -34,6 +38,10 @@ const MODE_SETTLE: Duration = Duration::from_millis(50);
 /// send it. Worth saying out loud, because the kernel gives up on a report that takes more than
 /// five seconds and that ends the session.
 const SLOW_OPERATION: Duration = Duration::from_millis(500);
+
+/// How long a button in multi-click mode waits after being released for another press, before it
+/// reports the ones it has counted
+const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
 /// Carries out one thing we ask of a device, reporting it when it fails or drags.
 ///
@@ -277,8 +285,14 @@ async fn session(
         dimmed: watch::Sender::new(false),
     };
 
+    // Every button reports each press straight away until Home Assistant switches it to counting
+    // them. Shared the same way the backlight is: the command loop changes it, the input loop acts
+    // on it.
+    let multi_click = watch::Sender::new(HashSet::new());
+
     mqtt::publish_timeout_state(mqtt_client, serial, true).await;
     mqtt::publish_brightness_state(mqtt_client, serial, config.brightness).await;
+    mqtt::publish_multi_click_states(mqtt_client, serial, kind, &HashSet::new()).await;
 
     // Only ask for the commands Home Assistant has retained once the configured images are on the
     // device, so they arrive afterwards and take over rather than being overwritten
@@ -298,8 +312,24 @@ async fn session(
     // waiting for a keypress under this lock would stop everything else from writing.
     let device = Mutex::new(device);
 
-    let input = input_loop(&device, &reader, serial, config, mqtt_client, &backlight);
-    let commands = command_loop(&device, kind, serial, mqtt_client, mqtt_events, &backlight);
+    let input = input_loop(
+        &device,
+        &reader,
+        serial,
+        config,
+        mqtt_client,
+        &backlight,
+        &multi_click,
+    );
+    let commands = command_loop(
+        &device,
+        kind,
+        serial,
+        mqtt_client,
+        mqtt_events,
+        &backlight,
+        &multi_click,
+    );
 
     tokio::select! {
         result = input => result,
@@ -310,7 +340,8 @@ async fn session(
 }
 
 /// Carries out what Home Assistant asks of the device for as long as it is connected: the images
-/// to put on the screens it addresses, whether those screens may dim, and how brightly they are lit
+/// to put on the screens it addresses, which buttons count their presses, whether those screens may
+/// dim, and how brightly they are lit
 async fn command_loop(
     device: &Mutex<&Device>,
     kind: Kind,
@@ -318,6 +349,7 @@ async fn command_loop(
     mqtt_client: &AsyncClient,
     events: &mut broadcast::Receiver<MqttEvent>,
     backlight: &Backlight,
+    multi_click: &watch::Sender<HashSet<u8>>,
 ) -> Result<(), MirajazzError> {
     use broadcast::error::RecvError;
 
@@ -344,6 +376,9 @@ async fn command_loop(
                     Some(Command::Brightness(percent)) => {
                         set_brightness(serial, mqtt_client, &backlight.brightness, percent).await;
                     }
+                    Some(Command::MultiClick(id, enabled)) => {
+                        set_multi_click(kind, serial, mqtt_client, multi_click, id, enabled).await;
+                    }
                     None => {}
                 }
             }
@@ -352,10 +387,12 @@ async fn command_loop(
                 // without persistence has none of our discovery configs or states either
                 let enabled = *backlight.timeout.borrow();
                 let percent = *backlight.brightness.borrow();
+                let counting = multi_click.borrow().clone();
 
                 mqtt::publish_discovery(mqtt_client, serial, kind).await;
                 mqtt::publish_timeout_state(mqtt_client, serial, enabled).await;
                 mqtt::publish_brightness_state(mqtt_client, serial, percent).await;
+                mqtt::publish_multi_click_states(mqtt_client, serial, kind, &counting).await;
                 mqtt::subscribe_commands(mqtt_client, serial).await;
             }
             // Images are big, so only a few are kept waiting. Dropping the ones this device
@@ -380,6 +417,10 @@ async fn command_loop(
 /// It isn't the only one that wakes them, though: the command loop does too, to show an image on a
 /// device that had gone to sleep. `dimmed` is how the two keep the same idea of what state the
 /// screens are in, and how this loop hears about a wake it didn't do itself.
+///
+/// A button reports each press as it goes down, unless it is one of those in `multi_click`. Those
+/// count their releases instead, and report how many there were once `MULTI_CLICK_WINDOW` passes
+/// without another.
 async fn input_loop(
     device: &Mutex<&Device>,
     reader: &DeviceStateReader,
@@ -387,8 +428,9 @@ async fn input_loop(
     config: &DeviceConfig,
     mqtt_client: &AsyncClient,
     backlight: &Backlight,
+    multi_click: &watch::Sender<HashSet<u8>>,
 ) -> Result<(), MirajazzError> {
-    use tokio::time::{Duration, Instant, timeout_at};
+    use tokio::time::{Duration, Instant, sleep_until, timeout_at};
 
     // We dim after `timeout` seconds of inactivity, unless the timeout is switched off.
     let idle_timeout = Duration::from_secs(config.timeout);
@@ -401,7 +443,19 @@ async fn input_loop(
     let mut timeout_changes = backlight.timeout.subscribe();
     let mut brightness_changes = backlight.brightness.subscribe();
 
+    // Buttons that went down while they were counting their presses. Whether a release counts is
+    // decided by this rather than by the mode at the time of the release, so a button switched
+    // over while it is held neither reports the same press twice nor loses it.
+    let mut held = HashSet::new();
+    // The presses counted so far for every button still waiting to see if another follows, and
+    // when it stops waiting. A button that is down again has no such time: it can't be done
+    // counting until it is released, however long it is held.
+    let mut presses: HashMap<u8, (u32, Option<Instant>)> = HashMap::new();
+
     loop {
+        // The soonest any button is done counting, copied out so the counts can change below
+        let presses_due = presses.values().filter_map(|&(_, due)| due).min();
+
         // Read back rather than remembered, because the command loop wakes the screens too
         let is_dimmed = *dim_changes.borrow_and_update();
 
@@ -461,6 +515,27 @@ async fn input_loop(
 
                 continue;
             }
+            // A button has gone long enough without another press to report the ones it counted
+            _ = async {
+                match presses_due {
+                    Some(due) => sleep_until(due).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let now = Instant::now();
+                let done: Vec<_> = presses
+                    .iter()
+                    .filter(|&(_, &(_, due))| due.is_some_and(|due| due <= now))
+                    .map(|(&i, &(count, _))| (i, count))
+                    .collect();
+
+                for (i, count) in done {
+                    presses.remove(&i);
+                    mqtt::handle_button(mqtt_client, serial, i, count).await;
+                }
+
+                continue;
+            }
         };
 
         let updates = match result {
@@ -503,7 +578,35 @@ async fn input_loop(
         for update in updates {
             match update {
                 DeviceStateUpdate::ButtonDown(i) => {
-                    mqtt::handle_button(mqtt_client, serial, i).await;
+                    let counting = multi_click.borrow().contains(&i);
+
+                    if counting {
+                        held.insert(i);
+
+                        // Pressed again in time, so hold off reporting until this press is
+                        // released too, rather than letting the window run out while it is down
+                        if let Some((_, due)) = presses.get_mut(&i) {
+                            *due = None;
+                        }
+                    } else {
+                        // Presses counted before the button stopped counting them happened first,
+                        // so they are reported first
+                        if let Some((count, _)) = presses.remove(&i) {
+                            mqtt::handle_button(mqtt_client, serial, i, count).await;
+                        }
+
+                        mqtt::handle_button(mqtt_client, serial, i, 1).await;
+                    }
+                }
+                DeviceStateUpdate::ButtonUp(i) => {
+                    if held.remove(&i) {
+                        // Every release gives the button the whole window again to be pressed once
+                        // more
+                        let count = presses.get(&i).map_or(0, |&(count, _)| count);
+                        let due = Instant::now() + MULTI_CLICK_WINDOW;
+
+                        presses.insert(i, (count + 1, Some(due)));
+                    }
                 }
                 DeviceStateUpdate::EncoderTwist(i, value) => {
                     mqtt::handle_knob(mqtt_client, serial, i, value).await;
@@ -598,6 +701,50 @@ async fn set_brightness(
     println!("[{serial}] Screen brightness set to {percent}%");
 
     mqtt::publish_brightness_state(mqtt_client, serial, percent).await;
+}
+
+/// Switches a button between reporting each press as it goes down and counting its presses, and
+/// reports it back. The input loop is what acts on it, from the next time the button goes down.
+async fn set_multi_click(
+    kind: Kind,
+    serial: &str,
+    mqtt_client: &AsyncClient,
+    multi_click: &watch::Sender<HashSet<u8>>,
+    id: u8,
+    enabled: bool,
+) {
+    if id as usize >= kind.key_count() {
+        println!(
+            "[{serial}] Ignoring multi-click setting for button {id}: the {} {} has {} buttons",
+            kind.manufacturer(),
+            kind.model(),
+            kind.key_count()
+        );
+
+        return;
+    }
+
+    // A command that says what the setting already is happens on every reconnect, when the broker
+    // replays the retained one, and isn't worth telling Home Assistant about again
+    let changed = multi_click.send_if_modified(|buttons| {
+        if enabled {
+            buttons.insert(id)
+        } else {
+            buttons.remove(&id)
+        }
+    });
+
+    if !changed {
+        return;
+    }
+
+    println!(
+        "[{serial}] Multi-click {} for {}",
+        if enabled { "enabled" } else { "disabled" },
+        kind.button_label(id)
+    );
+
+    mqtt::publish_multi_click_state(mqtt_client, serial, kind, id, enabled).await;
 }
 
 /// Pings devices that drop the connection when idle. Never returns for devices that don't
